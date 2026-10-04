@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A tiny in-memory stand-in for the GitHub REST issues API.
 
-It implements just what `bd github push/pull`, gh-to-beads.sh and
-bd-gh-watch call:
+It implements just what `bd github push/pull`, and `bd-gh-sync`
+call:
 
   GET    /repos/{o}/{r}/issues[?state=&since=&page=]
   GET    /repos/{o}/{r}/issues/{n}
@@ -19,6 +19,9 @@ bd-gh-watch call:
   POST   /repos/{o}/{r}/issues/{n}/dependencies/blocked_by {"issue_id": id}
   DELETE /repos/{o}/{r}/issues/{n}/dependencies/blocked_by/{id}
   POST   /graphql   (the relations query: every issue's parent and blockedBy)
+  GET    /repos/{o}/{r}/hooks
+  POST   /repos/{o}/{r}/hooks
+  PATCH  /repos/{o}/{r}/hooks/{id}
 
 plus test hooks:
 
@@ -37,13 +40,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 LOCK = threading.Lock()
-ISSUES = {}
-COMMENTS = {}   # number -> [comment]
-PARENT = {}     # sub-issue number -> parent number
-BLOCKED_BY = {}  # number -> [blocking numbers]
-STATE = {"writes": 0, "next": 1, "next_comment": 1}
+ISSUES = {}      # ("owner/repo", number) -> issue
+COMMENTS = {}    # issue id -> [comment]
+PARENT = {}      # sub-issue id -> parent id
+BLOCKED_BY = {}  # issue id -> [blocking issue ids]
+HOOKS = {}       # "owner/repo" -> [hook]
+STATE = {"writes": 0, "next": {}, "next_id": 1, "next_comment": 1}
 
 ISSUE_PATH = re.compile(r"/repos/([^/]+)/([^/]+)/issues(?:/(\d+)(/.*)?)?")
+HOOK_PATH = re.compile(r"/repos/([^/]+/[^/]+)/hooks(?:/(\d+))?")
 
 
 def now():
@@ -59,15 +64,20 @@ def user(login):
 
 
 def view(issue):
-    return dict(issue, comments=len(COMMENTS.get(issue["number"], [])))
+    return dict(issue, comments=len(COMMENTS.get(issue["id"], [])))
 
 
 def by_id(issue_id):
     return next((i for i in ISSUES.values() if i["id"] == issue_id), None)
 
 
-def gql_ref(number, repo):
-    return {"number": number, "repository": {"nameWithOwner": repo}}
+def repo_of(issue):
+    return issue["repository_url"].split("/repos/")[1]
+
+
+def gql_ref(issue_id):
+    issue = by_id(issue_id)
+    return {"number": issue["number"], "repository": {"nameWithOwner": repo_of(issue)}}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -94,10 +104,37 @@ class Handler(BaseHTTPRequestHandler):
         m = ISSUE_PATH.fullmatch(url.path)
         if not m:
             return url, None, None, None
-        issue = ISSUES.get(int(m.group(3))) if m.group(3) else None
+        issue = ISSUES.get((f"{m.group(1)}/{m.group(2)}", int(m.group(3)))) if m.group(3) else None
         return url, m, issue, m.group(4) or ""
 
+    def hooks(self, method):
+        m = HOOK_PATH.fullmatch(urlparse(self.path).path)
+        if not m:
+            return False
+        repo, hook_id = m.group(1), m.group(2)
+        with LOCK:
+            hooks = HOOKS.setdefault(repo, [])
+            if method == "GET" and not hook_id:
+                self.send(200, hooks)
+            elif method == "POST" and not hook_id:
+                STATE["writes"] += 1
+                hook = dict(self.body(), id=len(hooks) + 1)
+                hooks.append(hook)
+                self.send(201, hook)
+            elif method == "PATCH" and hook_id:
+                STATE["writes"] += 1
+                hook = next((h for h in hooks if h["id"] == int(hook_id)), None)
+                if not hook:
+                    return self.not_found() or True
+                hook.update(self.body())
+                self.send(200, hook)
+            else:
+                self.not_found()
+        return True
+
     def do_GET(self):
+        if self.hooks("GET"):
+            return
         url, m, issue, sub = self.route()
         with LOCK:
             if url.path == "/_stats":
@@ -109,30 +146,33 @@ class Handler(BaseHTTPRequestHandler):
             if m.group(3):
                 if not issue:
                     return self.not_found()
-                n = issue["number"]
+                i = issue["id"]
                 if sub == "":
                     return self.send(200, view(issue))
                 if sub == "/comments":
-                    return self.send(200, COMMENTS.get(n, []))
+                    return self.send(200, COMMENTS.get(i, []))
                 if sub == "/sub_issues":
-                    return self.send(200, [view(ISSUES[c]) for c, p in PARENT.items() if p == n])
+                    return self.send(200, [view(by_id(c)) for c, p in PARENT.items() if p == i])
                 if sub == "/dependencies/blocked_by":
-                    return self.send(200, [view(ISSUES[b]) for b in BLOCKED_BY.get(n, [])])
+                    return self.send(200, [view(by_id(b)) for b in BLOCKED_BY.get(i, [])])
                 return self.not_found()
             q = parse_qs(url.query)
             if q.get("page", ["1"])[0] != "1":
                 return self.send(200, [])
             state = q.get("state", ["open"])[0]
             since = q.get("since", [""])[0]
+            repo = f"{m.group(1)}/{m.group(2)}"
             out = [
-                view(i) for i in ISSUES.values()
-                if (state == "all" or i["state"] == state) and (not since or i["updated_at"] >= since)
+                view(i) for (r, _), i in ISSUES.items()
+                if r == repo and (state == "all" or i["state"] == state) and (not since or i["updated_at"] >= since)
             ]
             return self.send(200, out)
 
     def do_POST(self):
         if urlparse(self.path).path == "/graphql":
             return self.graphql()
+        if self.hooks("POST"):
+            return
         url, m, issue, sub = self.route()
         if not m:
             return self.not_found()
@@ -154,33 +194,34 @@ class Handler(BaseHTTPRequestHandler):
                     "created_at": now(),
                 }
                 STATE["next_comment"] += 1
-                COMMENTS.setdefault(issue["number"], []).append(c)
+                COMMENTS.setdefault(issue["id"], []).append(c)
                 issue["updated_at"] = now()
                 return self.send(201, c)
             if sub == "/sub_issues":
                 child = by_id(body.get("sub_issue_id"))
                 if not child:
                     return self.not_found()
-                if child["number"] in PARENT:
+                if child["id"] in PARENT:
                     return self.send(422, {"message": "Issue already has a parent"})
-                PARENT[child["number"]] = issue["number"]
+                PARENT[child["id"]] = issue["id"]
                 return self.send(201, view(child))
             if sub == "/dependencies/blocked_by":
                 blocker = by_id(body.get("issue_id"))
                 if not blocker:
                     return self.not_found()
-                deps = BLOCKED_BY.setdefault(issue["number"], [])
-                if blocker["number"] not in deps:
-                    deps.append(blocker["number"])
+                deps = BLOCKED_BY.setdefault(issue["id"], [])
+                if blocker["id"] not in deps:
+                    deps.append(blocker["id"])
                 return self.send(201, view(blocker))
             if sub:
                 return self.not_found()
-            n = STATE["next"]
-            STATE["next"] += 1
             owner, repo = m.group(1), m.group(2)
+            n = STATE["next"].get((owner, repo), 1)
+            STATE["next"][(owner, repo)] = n + 1
+            STATE["next_id"] += 1
             ts = now()
             issue = {
-                "id": 1000 + n,
+                "id": 1000 + STATE["next_id"],
                 "node_id": f"I_{n}",
                 "number": n,
                 "title": body.get("title", ""),
@@ -191,15 +232,18 @@ class Handler(BaseHTTPRequestHandler):
                 "assignees": [],
                 "html_url": f"https://github.com/{owner}/{repo}/issues/{n}",
                 "url": f"https://api.github.com/repos/{owner}/{repo}/issues/{n}",
+                "repository_url": f"https://api.github.com/repos/{owner}/{repo}",
                 "created_at": ts,
                 "updated_at": ts,
                 "closed_at": None,
                 "user": {"login": "tester", "id": 1},
             }
-            ISSUES[n] = issue
+            ISSUES[(f"{owner}/{repo}", n)] = issue
             return self.send(201, view(issue))
 
     def do_PATCH(self):
+        if self.hooks("PATCH"):
+            return
         url, m, issue, sub = self.route()
         if not m or sub or not issue:
             return self.not_found()
@@ -226,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.not_found()
         with LOCK:
             STATE["writes"] += 1
-            n = issue["number"]
+            i = issue["id"]
             if sub.startswith("/labels/"):
                 name = unquote(sub[len("/labels/"):])
                 issue["labels"] = [l for l in issue["labels"] if l["name"] != name]
@@ -234,16 +278,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, issue["labels"])
             if sub == "/sub_issue":
                 child = by_id(self.body().get("sub_issue_id"))
-                if not child or PARENT.get(child["number"]) != n:
+                if not child or PARENT.get(child["id"]) != i:
                     return self.not_found()
-                del PARENT[child["number"]]
+                del PARENT[child["id"]]
                 return self.send(200, view(issue))
             dep = re.fullmatch(r"/dependencies/blocked_by/(\d+)", sub)
             if dep:
                 blocker = by_id(int(dep.group(1)))
-                if not blocker or blocker["number"] not in BLOCKED_BY.get(n, []):
+                if not blocker or blocker["id"] not in BLOCKED_BY.get(i, []):
                     return self.not_found()
-                BLOCKED_BY[n].remove(blocker["number"])
+                BLOCKED_BY[i].remove(blocker["id"])
                 return self.send(200, view(blocker))
             return self.not_found()
 
@@ -254,10 +298,11 @@ class Handler(BaseHTTPRequestHandler):
             nodes = [
                 {
                     "number": n,
-                    "parent": gql_ref(PARENT[n], repo) if n in PARENT else None,
-                    "blockedBy": {"nodes": [gql_ref(b, repo) for b in BLOCKED_BY.get(n, [])]},
+                    "parent": gql_ref(PARENT[i["id"]]) if i["id"] in PARENT else None,
+                    "blockedBy": {"nodes": [gql_ref(b) for b in BLOCKED_BY.get(i["id"], [])]},
                 }
-                for n in sorted(ISSUES)
+                for (r, n), i in sorted(ISSUES.items())
+                if r == repo
             ]
         return self.send(200, {"data": {"repository": {"issues": {
             "pageInfo": {"hasNextPage": False, "endCursor": None},

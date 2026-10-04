@@ -10,7 +10,7 @@ moment something changes:
 | Direction | What runs | When |
 |---|---|---|
 | GitHub → beads | a GitHub Action ([`action.yml`](action.yml)) running `bd github pull` for every issue updated since its last sync | a minute after the last of a burst of `issues` / `issue_comment` events, every 15 minutes, and a full reconcile every 6 hours |
-| beads → GitHub | a local watcher ([`bin/bd-gh-watch`](bin/bd-gh-watch)) running `bd github push <ids>` | within a second or two of a local bead change |
+| beads → GitHub | a local watcher (`bd-gh-sync watch`) running `bd github push <ids>` | within a second or two of a local bead change |
 
 What syncs, both ways:
 
@@ -27,7 +27,7 @@ What syncs, both ways:
  GitHub issue edited ──issues event──▶ Action: bd github pull N ──▶ bd dolt push (or commit issues.jsonl)
                                                                          │
                                                                          ▼
- GitHub issue updated ◀── bd github push <ids> ◀── bd-gh-watch ◀── local beads (bd dolt pull / git pull)
+ GitHub issue updated ◀── bd github push <ids> ◀── bd-gh-sync watch ◀── local beads (bd dolt pull / git pull)
 ```
 
 Tested with beads 1.3.1.
@@ -43,7 +43,7 @@ are supported, and the Action picks one automatically (`transport: auto`):
   to your origin, and beads stores its Dolt data under `refs/dolt/data` in the
   same GitHub repository. Run `bd dolt push` once from your clone so the data
   exists on GitHub; after that the Action uses `bd dolt pull` / `bd dolt push`.
-  Clones pick up GitHub changes with `bd dolt pull` (or `bd-gh-watch --dolt-sync`).
+  Clones pick up GitHub changes with `bd dolt pull` (or `bd-gh-sync watch --dolt-sync`).
 - **JSONL export.** For repos without a Dolt remote (`bd config unset
   sync.remote`), the Action commits `.beads/issues.jsonl`. Set `import.auto: true`
   and `export.auto: true` in `.beads/config.yaml` so clones import it on
@@ -86,27 +86,29 @@ Action inputs:
 ### 3. Run the watcher locally
 
 ```sh
+cargo install --git https://github.com/Takashiidobe/bd-gh-sync
 bd config set github.repository owner/repo   # once per clone
 export GITHUB_TOKEN=...                      # or be logged in with `gh auth login`
-bin/bd-gh-watch --dolt-sync 30
+bd-gh-sync watch --dolt-sync 30
 ```
 
-Requirements: bash 4+, `jq`, `bd`, and `inotifywait` (Linux, `inotify-tools`) or
-`fswatch` (macOS). With neither installed it polls. Options:
+It needs `bd` on the `PATH` (or in `$BD`). It watches `.beads/` with the
+platform's file events (inotify, FSEvents, ...) and falls back to polling when
+those are unavailable. Options:
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--poll SECONDS` | `30` | safety-net poll (and the interval when polling) |
 | `--debounce SECONDS` | `1` | quiet period that ends a burst of writes |
-| `--backend NAME` | auto | `inotify`, `fswatch` or `poll` |
+| `--backend NAME` | `native` | `native` (file events) or `poll` |
 | `--dolt-sync SECONDS` | `0` (off) | `bd dolt pull` on this interval to bring in what the Action pulled, and `bd dolt push` after each GitHub push to publish new issue links |
 | `--initial-push` | off | on the first run, push every bead instead of only later changes |
 | `--once` | | one pass, then exit (handy in hooks or cron) |
 | `--dry-run` | | show what would be pushed |
 
 The watcher keeps its per-clone state in `.git/bd-gh-sync/`, so it catches up on
-changes made while it was stopped. It talks to the GitHub REST API with `curl`
-for assignees, comments and relations (`GITHUB_API_URL` for GitHub Enterprise).
+changes made while it was stopped (one watcher per clone; a second one refuses
+to start). It talks to the GitHub REST API directly for assignees, comments and relations (`GITHUB_API_URL` for GitHub Enterprise).
 
 ## Sync loops
 

@@ -1,0 +1,293 @@
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use serde_json::Value;
+use tokio::process::Command;
+
+#[derive(Debug, Clone)]
+pub struct Workdir {
+    pub dir: PathBuf,
+    pub vars: Vec<(String, String)>,
+}
+
+pub struct Output {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Output {
+    pub fn combined(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr).trim().to_string()
+    }
+}
+
+impl Workdir {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            vars: Vec::new(),
+        }
+    }
+
+    pub fn env(mut self, key: &str, value: impl Into<String>) -> Self {
+        self.vars.push((key.to_string(), value.into()));
+        self
+    }
+
+    pub fn command(&self, program: &str) -> Command {
+        let mut cmd = Command::new(program);
+        cmd.current_dir(&self.dir)
+            .envs(self.vars.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        cmd
+    }
+
+    pub async fn output(&self, program: &str, args: &[&str]) -> Result<Output> {
+        let out = self
+            .command(program)
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("running {program}"))?;
+        Ok(Output {
+            success: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    pub async fn run(&self, program: &str, args: &[&str]) -> Result<String> {
+        let out = self.output(program, args).await?;
+        if !out.success {
+            bail!("`{program} {}` failed:\n{}", args.join(" "), out.combined());
+        }
+        Ok(out.stdout)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Bead {
+    #[serde(rename = "_type")]
+    pub kind: Option<String>,
+    pub id: String,
+    pub title: Value,
+    pub description: Option<String>,
+    pub status: Value,
+    pub priority: Value,
+    pub issue_type: Value,
+    pub labels: Option<Vec<String>>,
+    pub assignee: Option<String>,
+    pub external_ref: Option<String>,
+    pub comments: Option<Vec<Comment>>,
+    pub dependencies: Option<Vec<Dependency>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Comment {
+    pub id: String,
+    pub author: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Dependency {
+    pub issue_id: String,
+    pub depends_on_id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+pub const RELATION_TYPES: &[&str] = &["blocks", "parent-child"];
+
+impl Bead {
+    pub fn comments(&self) -> &[Comment] {
+        self.comments.as_deref().unwrap_or_default()
+    }
+
+    pub fn relations(&self) -> impl Iterator<Item = &Dependency> {
+        self.dependencies
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|d| RELATION_TYPES.contains(&d.kind.as_str()))
+    }
+}
+
+pub fn parse_export(text: &str) -> Result<Vec<Bead>> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Bead>(line).context("parsing bd export"))
+        .filter(|bead| {
+            bead.as_ref()
+                .map_or(true, |b| b.kind.as_deref().is_none_or(|k| k == "issue"))
+        })
+        .collect()
+}
+
+pub struct Bd<'a> {
+    wd: &'a Workdir,
+    bin: String,
+}
+
+static TEMP_FILES: AtomicU64 = AtomicU64::new(0);
+
+impl<'a> Bd<'a> {
+    pub fn new(wd: &'a Workdir) -> Self {
+        Self {
+            wd,
+            bin: std::env::var("BD").unwrap_or_else(|_| "bd".into()),
+        }
+    }
+
+    pub async fn run(&self, args: &[&str]) -> Result<String> {
+        self.wd.run(&self.bin, args).await
+    }
+
+    pub async fn output(&self, args: &[&str]) -> Result<Output> {
+        self.wd.output(&self.bin, args).await
+    }
+
+    pub async fn export_raw(&self) -> Result<String> {
+        self.run(&["export"]).await
+    }
+
+    pub async fn export(&self) -> Result<Vec<Bead>> {
+        parse_export(&self.export_raw().await?)
+    }
+
+    pub async fn export_to(&self, path: &Path) -> Result<()> {
+        self.run(&["export", "-o", &path.to_string_lossy()])
+            .await
+            .map(drop)
+    }
+
+    pub async fn import(&self, path: &Path) -> Result<()> {
+        self.run(&["import", "--allow-stale", &path.to_string_lossy()])
+            .await
+            .map(drop)
+    }
+
+    pub async fn bootstrap(&self) -> Result<()> {
+        self.run(&["bootstrap", "--yes"]).await.map(drop)
+    }
+
+    pub async fn config_get(&self, key: &str) -> Result<Option<String>> {
+        let out = self.output(&["config", "get", key, "--json"]).await?;
+        Ok(json_field(&out.stdout, "value"))
+    }
+
+    pub async fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        let out = self.output(&["kv", "get", key, "--json"]).await?;
+        let found = serde_json::from_str::<Value>(&out.stdout)
+            .is_ok_and(|v| v["found"].as_bool() == Some(true));
+        Ok(if found {
+            json_field(&out.stdout, "value")
+        } else {
+            None
+        })
+    }
+
+    pub async fn kv_set(&self, key: &str, value: &str) -> Result<()> {
+        self.run(&["kv", "set", key, value]).await.map(drop)
+    }
+
+    pub async fn dolt_commit(&self, message: &str) -> Result<()> {
+        let out = self.output(&["dolt", "commit", "-m", message]).await?;
+        if !out.success && !out.combined().to_lowercase().contains("nothing to commit") {
+            bail!("bd dolt commit failed:\n{}", out.combined());
+        }
+        Ok(())
+    }
+
+    pub async fn dolt_pull(&self) -> Result<()> {
+        self.run(&["dolt", "pull"]).await.map(drop)
+    }
+
+    pub async fn dolt_push(&self) -> Result<()> {
+        self.run(&["dolt", "push"]).await.map(drop)
+    }
+
+    pub async fn github_pull(&self, numbers: &[u64]) -> Result<Output> {
+        let numbers: Vec<String> = numbers.iter().map(u64::to_string).collect();
+        let mut args = vec!["github", "pull"];
+        args.extend(numbers.iter().map(String::as_str));
+        let out = self.output(&args).await?;
+        if !out.success {
+            bail!("bd github pull failed:\n{}", out.combined());
+        }
+        Ok(out)
+    }
+
+    pub async fn github_push(&self, ids: &[String]) -> Result<Output> {
+        let mut args = vec!["github", "push"];
+        args.extend(ids.iter().map(String::as_str));
+        self.output(&args).await
+    }
+
+    pub async fn comment_add(&self, id: &str, author: &str, text: &str) -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "bd-gh-sync-{}-{}.txt",
+            std::process::id(),
+            TEMP_FILES.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, text)?;
+        let result = self
+            .run(&[
+                "comments",
+                "add",
+                id,
+                "-a",
+                author,
+                "-f",
+                &path.to_string_lossy(),
+            ])
+            .await;
+        let _ = std::fs::remove_file(&path);
+        result.map(drop)
+    }
+
+    pub async fn dep_add(&self, from: &str, to: &str, kind: &str) -> Result<()> {
+        self.run(&["dep", "add", from, to, "-t", kind])
+            .await
+            .map(drop)
+    }
+
+    pub async fn dep_remove(&self, from: &str, to: &str) -> Result<()> {
+        self.run(&["dep", "remove", from, to]).await.map(drop)
+    }
+}
+
+fn json_field(text: &str, key: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value[key]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_keeps_issues_only() {
+        let text = r#"{"_type":"issue","id":"a-1","title":"x","dependencies":[{"issue_id":"a-1","depends_on_id":"a-2","type":"blocks"},{"issue_id":"a-1","depends_on_id":"a-3","type":"related"}]}
+{"_type":"memory","id":"m"}
+{"id":"a-2","title":"y","comments":[{"id":"c","author":"me","text":"hi"}]}
+"#;
+        let beads = parse_export(text).unwrap();
+        assert_eq!(beads.len(), 2);
+        assert_eq!(beads[0].relations().count(), 1);
+        assert_eq!(beads[1].comments()[0].text, "hi");
+    }
+}

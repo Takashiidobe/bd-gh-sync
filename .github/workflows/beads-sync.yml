@@ -1,5 +1,5 @@
 # Pull GitHub issue changes into this repository's beads as they happen.
-# Local bead changes go the other way through bin/bd-gh-watch.
+# Local bead changes go the other way through `bd-gh-sync watch`.
 name: beads sync
 
 on:

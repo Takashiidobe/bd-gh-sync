@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# End-to-end tests for bd-gh-watch and gh-to-beads.sh.
+# End-to-end tests for `bd-gh-sync watch` and `bd-gh-sync sync`.
 #
 # Uses the real bd binary against a fake GitHub API (tests/fake_github.py)
 # and local bare git remotes, so it runs offline and touches no real repo.
 #
-# Requirements: bd, jq, git, curl, python3. inotifywait is used for the live
-# watcher test when present; otherwise that test uses the polling backend.
+# Requirements: cargo, bd, jq, git, curl, python3.
 
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
-WATCH=$ROOT/bin/bd-gh-watch
-SYNC=$ROOT/scripts/gh-to-beads.sh
+cargo build -q --manifest-path "$ROOT/Cargo.toml"
+BIN=$ROOT/target/debug/bd-gh-sync
+watch() { "$BIN" watch "$@"; }
 
 WORK=$(mktemp -d)
 cleanup() {
@@ -31,7 +31,6 @@ API=http://127.0.0.1:$(cat "$WORK/port")
 export GITHUB_API_URL=$API
 export GITHUB_TOKEN=test-token GH_TOKEN=test-token
 export GITHUB_REPOSITORY=acme/widgets
-export GH=$HERE/stubs/gh
 export BD_NON_INTERACTIVE=1 NO_COLOR=1
 export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
 export GIT_AUTHOR_NAME=tester GIT_AUTHOR_EMAIL=tester@example.com
@@ -63,7 +62,7 @@ bead_deps() { bd export | jq -r --arg id "$1" 'select(.id == $id) | [(.dependenc
 # Run the action's script in DIR and keep only its own log lines.
 sync_in() {
   local dir=$1; shift
-  (cd "$dir" && "$SYNC" --publish "$@") 2>&1 | tee -a "$WORK/action.log" | grep '^gh-to-beads:' || true
+  (cd "$dir" && "$BIN" sync --publish "$@") 2>&1 | tee -a "$WORK/action.log" || true
 }
 
 # Run the action's script in a fresh clone, like a workflow run would.
@@ -93,12 +92,12 @@ check "origin has Dolt data" test "$(dolt_ref "$WORK/origin.git")" != none
 # --------------------------------------------------------------------------
 step "watcher: first run records a baseline without pushing"
 quiet bd create "pre-existing bead" -t task -p 2
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "no GitHub writes" test "$(writes)" = 0
 
 step "watcher: a new bead becomes a GitHub issue"
 quiet bd create "local feature" -t feature -p 1 -l ui -d "made locally"
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "one issue created" test "$(writes)" = 1
 check "issue has the bead's title" test "$(gh_issue 1 | jq -r .title)" = "local feature"
 check "issue carries bd's labels" test "$(gh_issue 1 | jq -r '[.labels[].name] | sort | join(",")')" = "priority::high,type::feature,ui"
@@ -106,12 +105,12 @@ check "bead is linked" test "$(bead_field 'local feature' .external_ref)" = "htt
 check "pre-existing bead was not pushed" test "$(bead_field 'pre-existing' '.external_ref // "none"')" = none
 
 step "watcher: its own link write does not trigger another push"
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "no new GitHub writes" test "$(writes)" = 1
 
 step "watcher: an edit is pushed"
 quiet bd update "$(bead_field 'local feature' .id)" --status in_progress
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "issue updated" test "$(writes)" = 2
 check "status label on GitHub" test "$(gh_issue 1 | jq -r '[.labels[].name] | index("status::in_progress") != null')" = true
 
@@ -140,9 +139,9 @@ quiet bd dolt pull
 check "bead arrived locally" test "$(bead_field 'opened on github' .external_ref)" = "https://github.com/acme/widgets/issues/$n"
 
 step "loop guard: the imported bead settles after at most one push"
-"$WATCH" --once 2>/dev/null   # may add bd's type::/priority:: labels once
+watch --once 2>/dev/null   # may add bd's type::/priority:: labels once
 w=$(writes)
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "second pass writes nothing" test "$(writes)" = "$w"
 out=$(run_action "$WORK/origin.git" "$n")
 check "action sees nothing new" grep -q "pull changed nothing" <<<"$out"
@@ -153,26 +152,29 @@ w=$(writes)
 run_action "$WORK/origin.git" "$n" >/dev/null
 quiet bd dolt pull
 check "edit arrived locally" test -n "$(bead_field 'edited' .id)"
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "watcher did not write it back" test "$(writes)" = "$w"
 
 # --------------------------------------------------------------------------
 step "watcher: live mode pushes within seconds and then goes quiet"
-backend=poll
-command -v inotifywait >/dev/null && backend=inotify
-"$WATCH" --backend "$backend" --poll 2 --debounce 0.3 2>"$WORK/watch.log" &
-WATCH_PID=$!
-sleep 2
-quiet bd update "$(bead_field 'local feature' .id)" --title "local feature v2"
-for _ in $(seq 40); do
-  [ "$(gh_issue 1 | jq -r .title)" = "local feature v2" ] && break
-  sleep 0.5
+for backend in native poll; do
+  "$BIN" watch --backend "$backend" --poll 2 --debounce 0.3 2>"$WORK/watch.log" &
+  WATCH_PID=$!
+  sleep 2
+  title="local feature ($backend)"
+  quiet bd update "$(bead_field '^local feature' .id)" --title "$title"
+  for _ in $(seq 40); do
+    [ "$(gh_issue 1 | jq -r .title)" = "$title" ] && break
+    sleep 0.5
+  done
+  check "title reached GitHub ($backend)" test "$(gh_issue 1 | jq -r .title)" = "$title"
+  if watch --once 2>"$WORK/lock.err"; then fail "a second watcher ran ($backend)"; fi
+  check "a second watcher is refused ($backend)" grep -q "already running" "$WORK/lock.err"
+  w=$(writes)
+  sleep 5
+  check "no further writes while idle ($backend)" test "$(writes)" = "$w"
+  kill "$WATCH_PID"; wait "$WATCH_PID" 2>/dev/null || true; WATCH_PID=
 done
-check "title reached GitHub ($backend)" test "$(gh_issue 1 | jq -r .title)" = "local feature v2"
-w=$(writes)
-sleep 5
-check "no further writes while idle" test "$(writes)" = "$w"
-kill "$WATCH_PID"; wait "$WATCH_PID" 2>/dev/null || true; WATCH_PID=
 
 # --------------------------------------------------------------------------
 step "action --since-last: one run pulls every issue changed since the last sync"
@@ -191,7 +193,7 @@ out=$(run_action "$WORK/origin.git" --since-last)
 check "next run reads from the watermark" grep -q "pulling issues updated since" <<<"$out"
 quiet bd dolt pull
 check "later edit arrived" test -n "$(bead_field 'batch one \(edited\)' .id)"
-"$WATCH" --once   # settle bd's own labels on the new issues
+watch --once   # settle bd's own labels on the new issues
 run_action "$WORK/origin.git" --since-last >/dev/null
 quiet bd dolt pull
 
@@ -204,15 +206,15 @@ quiet bd dolt pull
 check "bead has the comment" test "$(bead_comments "$(bead_for "$a")")" = '[{"author":"octocat","text":"looks good"}]'
 out=$(run_action "$WORK/origin.git" --since-last)
 check "re-run imports nothing" test "$(bead_comments "$(bead_for "$a")" | jq length)" = 1
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "watcher does not echo it back" test "$(writes)" = $((w + 1))
 
 step "comments: a bead comment becomes a GitHub comment, once"
 quiet bd comments add "$(bead_for "$a")" "fixed in main"
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "posted to GitHub" test "$(gh_get "$a/comments" | jq -r 'last.body | startswith("fixed in main")')" = true
 check "carries the marker" grep -q "<!-- bd-comment:" <<<"$(gh_get "$a/comments" | jq -r 'last.body')"
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "posted only once" test "$(gh_get "$a/comments" | jq length)" = 2
 quiet bd dolt push
 run_action "$WORK/origin.git" --since-last >/dev/null
@@ -225,18 +227,18 @@ run_action "$WORK/origin.git" --since-last >/dev/null
 quiet bd dolt pull
 check "bead assignee set" test "$(bead_field 'batch one' .assignee)" = octocat
 w=$(writes)
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "watcher does not write it back" test "$(writes)" = "$w"
 
 step "assignees: beads -> GitHub"
 quiet bd update "$(bead_for "$a")" -a hubot
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "GitHub assignee replaced" test "$(gh_issue "$a" | jq -c '[.assignees[].login]')" = '["hubot"]'
 quiet bd update "$(bead_for "$a")" -a ghost-user
-"$WATCH" --once 2>"$WORK/watch.err" || true
+watch --once 2>"$WORK/watch.err" || true
 check "invalid login reported" grep -q "GitHub refused assignee 'ghost-user'" "$WORK/watch.err"
 w=$(writes)
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "and not retried" test "$(writes)" = "$w"
 quiet bd update "$(bead_for "$a")" -a hubot
 
@@ -249,7 +251,7 @@ quiet bd dolt pull
 check "sub-issue and blocked-by became dependencies" \
   test "$(bead_deps "$(bead_for "$b")")" = "blocks $(bead_for "$n"),parent-child $(bead_for "$a")"
 w=$(writes)
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "watcher does not write them back" test "$(writes)" = "$w"
 gh_delete "$b/dependencies/blocked_by/$(gh_id "$n")"
 run_action "$WORK/origin.git" --since-last >/dev/null
@@ -258,15 +260,15 @@ check "removal on GitHub removes the dependency" test "$(bead_deps "$(bead_for "
 
 step "relations: beads -> GitHub"
 quiet bd dep add "$(bead_for "$a")" "$(bead_for "$n")"
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "blocked-by link created" test "$(gh_get "$a/dependencies/blocked_by" | jq -c 'map(.number)')" = "[$n]"
 parent=$(bd create "local parent" -t epic -p 2 --silent)
 child=$(bd create "local child" -t task -p 2 --parent "$parent" --silent)
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "new beads and their sub-issue link pushed in one pass" \
   test "$(gh_get "$(issue_of "$parent")/sub_issues" | jq -c 'map(.number)')" = "[$(issue_of "$child")]"
 quiet bd dep remove "$(bead_for "$a")" "$(bead_for "$n")"
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "removing the dependency removes the link" test "$(gh_get "$a/dependencies/blocked_by" | jq length)" = 0
 
 step "relations: the Action keeps bead-only links that are not on GitHub yet"
@@ -275,7 +277,7 @@ quiet bd dolt push
 run_action "$WORK/origin.git" --since-last >/dev/null
 quiet bd dolt pull
 check "bead link kept" grep -q "blocks $(bead_for "$n")" <<<"$(bead_deps "$(bead_for "$b")")"
-"$WATCH" --once 2>/dev/null
+watch --once 2>/dev/null
 check "and the watcher then pushes it" test "$(gh_get "$b/dependencies/blocked_by" | jq -c 'map(.number)')" = "[$n]"
 
 # --------------------------------------------------------------------------
@@ -288,7 +290,7 @@ git clone -q "$WORK/fresh.git" "$WORK/fresh" 2>/dev/null
   quiet bd init --quiet --prefix fr --skip-agents --skip-hooks
   git add -A && { git commit -qm "init beads" || true; } && git push -q origin main
 )
-if out=$(cd "$WORK/fresh" && "$SYNC" --publish 1 2>&1); then
+if out=$(cd "$WORK/fresh" && "$BIN" sync --publish 1 2>&1); then
   fail "expected a failure"
 fi
 check "explains the fix" grep -q "Run 'bd dolt push' once" <<<"$out"
