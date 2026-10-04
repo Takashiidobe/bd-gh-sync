@@ -1,8 +1,9 @@
 name: beads GitHub sync
 description: >-
-  Pull GitHub issue changes into the repository's beads (bd) issue database
-  as they happen, using beads' native `bd github pull`, and publish the
-  result through beads' Dolt remote or the .beads/issues.jsonl export.
+  Pull GitHub issue changes (fields, comments, sub-issues and blocked-by
+  links) into the repository's beads (bd) issue database, using beads' native
+  `bd github pull`, and publish the result through beads' Dolt remote or the
+  .beads/issues.jsonl export.
 branding:
   icon: refresh-cw
   color: purple
@@ -10,9 +11,10 @@ branding:
 inputs:
   issues:
     description: >-
-      Space-separated issue numbers to pull, or "all" to reconcile every issue.
-      Defaults to the issue from the triggering `issues` / `issue_comment`
-      event, or "all" for `schedule` and `workflow_dispatch`.
+      Space-separated issue numbers to pull, "since" for every issue updated
+      since the last sync, or "all" to reconcile every issue. Defaults to
+      "since" for `issues`, `issue_comment` and `schedule` events, and "all"
+      for `workflow_dispatch`.
     required: false
     default: ""
   token:
@@ -70,13 +72,12 @@ runs:
       env:
         INPUT_ISSUES: ${{ inputs.issues }}
         EVENT_NAME: ${{ github.event_name }}
-        EVENT_ISSUE: ${{ github.event.issue.number }}
       run: |
         issues=$INPUT_ISSUES
         if [ -z "$issues" ]; then
           case $EVENT_NAME in
-            issues|issue_comment) issues=$EVENT_ISSUE ;;
-            schedule|workflow_dispatch) issues=all ;;
+            issues|issue_comment|schedule) issues=since ;;
+            workflow_dispatch) issues=all ;;
           esac
         fi
         echo "issues=$issues" >>"$GITHUB_OUTPUT"
@@ -103,6 +104,8 @@ runs:
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         if [ "$ISSUES" = all ]; then
           "$GITHUB_ACTION_PATH/scripts/gh-to-beads.sh" --publish --all
+        elif [ "$ISSUES" = since ]; then
+          "$GITHUB_ACTION_PATH/scripts/gh-to-beads.sh" --publish --since-last
         else
           # shellcheck disable=SC2086
           "$GITHUB_ACTION_PATH/scripts/gh-to-beads.sh" --publish $ISSUES

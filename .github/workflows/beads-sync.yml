@@ -5,13 +5,18 @@ name: beads sync
 on:
   issues:
     types: [opened, edited, closed, reopened, labeled, unlabeled, assigned, unassigned]
+  issue_comment:
+    types: [created]
   schedule:
-    # Safety net: reconcile every issue in case an event was missed.
+    # Sub-issue and blocked-by changes fire no workflow event; pick them up
+    # every 15 minutes.
+    - cron: "*/15 * * * *"
+    # Safety net: reconcile every issue in case something was missed.
     - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       issues:
-        description: Issue numbers to pull (space-separated), or "all"
+        description: Issue numbers to pull (space-separated), "since", or "all"
         required: false
         default: all
 
@@ -19,16 +24,29 @@ permissions:
   contents: write   # push the Dolt data / JSONL export
   issues: read
 
-# One sync at a time; queued runs still execute so no event is lost.
-concurrency:
-  group: beads-sync
-  cancel-in-progress: false
-
 jobs:
-  sync:
+  # Each event restarts this wait, so a burst of edits ends in one sync a
+  # minute after the last of them. Superseded runs show up as cancelled.
+  debounce:
+    if: github.event_name == 'issues' || github.event_name == 'issue_comment'
     runs-on: ubuntu-latest
+    concurrency:
+      group: beads-sync-debounce
+      cancel-in-progress: true
+    steps:
+      - run: sleep 60
+
+  sync:
+    needs: debounce
+    if: ${{ !cancelled() && contains(fromJSON('["success", "skipped"]'), needs.debounce.result) }}
+    runs-on: ubuntu-latest
+    # One sync at a time. A newer run replaces a pending one, which loses
+    # nothing: each sync pulls everything updated since the last.
+    concurrency:
+      group: beads-sync
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: ./
         with:
-          issues: ${{ inputs.issues }}
+          issues: ${{ inputs.issues || (github.event.schedule == '17 */6 * * *' && 'all') || '' }}

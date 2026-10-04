@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 # Minimal `gh` stand-in for the tests: `gh api [--paginate] PATH [--jq FILTER]`
-# against $GITHUB_API_URL (the fake GitHub server).
+# and `gh api graphql -f KEY=VALUE... [--jq FILTER]` against $GITHUB_API_URL
+# (the fake GitHub server).
 set -euo pipefail
 [ "${1:-}" = api ] || { echo "stub gh: only 'gh api' is supported" >&2; exit 1; }
 shift
 path=''
 filter=.
+fields='{}'
 while [ $# -gt 0 ]; do
   case $1 in
     --paginate) ;;
     --jq) filter=$2; shift ;;
+    -f|-F) fields=$(jq -c --arg k "${2%%=*}" --arg v "${2#*=}" '.[$k] = $v' <<<"$fields"); shift ;;
     *) path=$1 ;;
   esac
   shift
 done
-curl -fsS "$GITHUB_API_URL/${path#/}" | jq -r "$filter"
+if [ "$path" = graphql ]; then
+  jq -c '{query, variables: del(.query)}' <<<"$fields" \
+    | curl -fsS -X POST --data-binary @- "$GITHUB_API_URL/graphql" | jq -r "$filter"
+else
+  curl -fsS "$GITHUB_API_URL/${path#/}" | jq -r "$filter"
+fi
