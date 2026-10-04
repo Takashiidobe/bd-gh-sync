@@ -1,0 +1,34 @@
+# Pull GitHub issue changes into this repository's beads as they happen.
+# Local bead changes go the other way through bin/bd-gh-watch.
+name: beads sync
+
+on:
+  issues:
+    types: [opened, edited, closed, reopened, labeled, unlabeled, assigned, unassigned]
+  schedule:
+    # Safety net: reconcile every issue in case an event was missed.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      issues:
+        description: Issue numbers to pull (space-separated), or "all"
+        required: false
+        default: all
+
+permissions:
+  contents: write   # push the Dolt data / JSONL export
+  issues: read
+
+# One sync at a time; queued runs still execute so no event is lost.
+concurrency:
+  group: beads-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          issues: ${{ inputs.issues }}

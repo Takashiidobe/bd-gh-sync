@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# bd-gh-watch: push local bead changes to GitHub issues as they happen.
+#
+# Watches the beads database under .beads/ with inotifywait (Linux) or
+# fswatch (macOS), falling back to polling, and runs beads' native
+# `bd github push <ids>` for exactly the beads whose GitHub-visible fields
+# changed.
+#
+# Usage:
+#   bd-gh-watch [options]
+#
+# Options:
+#   -C DIR            run in DIR (default: current directory)
+#   --once            run a single sync pass and exit
+#   --initial-push    on the first run (no saved state), push every bead
+#                     instead of only changes made from now on
+#   --poll SECONDS    safety-net / fallback poll interval (default 30)
+#   --debounce SECS   quiet period that ends a burst of writes (default 1)
+#   --backend NAME    inotify | fswatch | poll (default: auto-detect)
+#   --dolt-sync SECS  also keep the beads Dolt remote in step: `bd dolt pull`
+#                     every SECS seconds (brings in what the GitHub Action
+#                     pulled) and `bd dolt push` after each GitHub push
+#                     (publishes the new issue links). Default 0 (off).
+#   --dry-run         show what would be pushed; do not push or save state
+#   -h, --help        show this help
+#
+# GitHub settings come from bd itself: `bd config set github.repository
+# owner/repo` (or GITHUB_REPOSITORY) and a token in GITHUB_TOKEN (falls back
+# to `gh auth token` when gh is installed).
+#
+# Loop guards (see README "Sync loops"):
+#   * only beads whose title, description, status, priority, type or labels
+#     changed since the last push are pushed; bd's own writes after a push
+#     (external_ref, updated_at) are ignored
+#   * the filesystem events caused by the watcher's own bd calls are drained
+#     and discarded after every pass
+#   * bd skips the API write when GitHub already matches (push content hash
+#     plus a field comparison), so beads that changed because a GitHub edit
+#     was imported from the JSONL produce no write and no new issue event
+#   * a lock file keeps two watchers on the same clone from racing
+
+set -euo pipefail
+
+BD=${BD:-bd}
+POLL=30
+DEBOUNCE=1
+BACKEND=auto
+ONCE=false
+INITIAL_PUSH=false
+DRY_RUN=false
+DOLT_SYNC=0
+
+log() { printf '%s bd-gh-watch: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "$*"; exit 1; }
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -C) cd "$2"; shift ;;
+    --once) ONCE=true ;;
+    --initial-push) INITIAL_PUSH=true ;;
+    --poll) POLL=$2; shift ;;
+    --debounce) DEBOUNCE=$2; shift ;;
+    --backend) BACKEND=$2; shift ;;
+    --dolt-sync) DOLT_SYNC=$2; shift ;;
+    --dry-run) DRY_RUN=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+command -v jq >/dev/null || die "jq is required"
+command -v "$BD" >/dev/null || die "bd is required (https://github.com/gastownhall/beads)"
+
+# Find the .beads directory the same way bd does: walk up from here.
+find_beads_dir() {
+  local d=$PWD
+  while [ "$d" != / ]; do
+    [ -d "$d/.beads" ] && { printf '%s\n' "$d/.beads"; return; }
+    d=$(dirname "$d")
+  done
+  return 1
+}
+BEADS_DIR=$(find_beads_dir) || die "no .beads directory found (run bd init first)"
+ROOT=$(dirname "$BEADS_DIR")
+cd "$ROOT"
+
+if [ -z "${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null; then
+  GITHUB_TOKEN=$(gh auth token 2>/dev/null || true)
+  export GITHUB_TOKEN
+fi
+
+# Per-clone state lives in the git dir so it is never committed.
+if GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null); then
+  STATE_DIR=$GIT_DIR/bd-gh-sync
+else
+  STATE_DIR=$BEADS_DIR/bd-gh-sync.local
+fi
+mkdir -p "$STATE_DIR"
+STATE=$STATE_DIR/pushed.json
+LOCK=$STATE_DIR/watch.lock
+
+exec 9>"$LOCK"
+if command -v flock >/dev/null; then
+  flock -n 9 || die "another bd-gh-watch is already running for $ROOT"
+fi
+
+# {id: fingerprint} of the GitHub-visible fields of every bead.
+fingerprints() {
+  "$BD" export | jq -cn '
+    [inputs
+     | select((._type // "issue") == "issue")
+     | {key: .id,
+        value: ({title, description: (.description // ""), status, priority,
+                 issue_type, labels: ((.labels // []) | sort)} | tojson)}]
+    | from_entries'
+}
+
+save_state() {
+  [ "$DRY_RUN" = true ] && return
+  printf '%s\n' "$1" >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+# Commit pending Dolt changes; a no-op when there are none.
+commit_dolt() {
+  local out
+  if ! out=$("$BD" dolt commit -m "$1" 2>&1) && ! grep -qi 'nothing to commit' <<<"$out"; then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+}
+
+# One pass: diff fingerprints against what was last pushed, push the delta.
+# Returns 0 when something was pushed, 1 when there was nothing to do,
+# 2 on failure.
+sync_pass() {
+  local current previous changed ids out
+  if ! current=$(fingerprints); then
+    log "bd export failed; will retry"
+    return 2
+  fi
+
+  if [ ! -s "$STATE" ]; then
+    if [ "$INITIAL_PUSH" != true ]; then
+      log "first run: recording $(jq length <<<"$current") bead(s) as the baseline (use --initial-push to push them all)"
+      save_state "$current"
+      return 1
+    fi
+    previous='{}'
+  else
+    previous=$(cat "$STATE")
+  fi
+
+  changed=$(jq -cn --argjson cur "$current" --argjson old "$previous" \
+    '[$cur | to_entries[] | select($old[.key] != .value) | .key]')
+  if [ "$changed" = '[]' ]; then
+    # Drop state for beads that no longer exist so it does not grow forever.
+    save_state "$(jq -cn --argjson cur "$current" --argjson old "$previous" \
+      '$old | with_entries(select($cur[.key] != null))')"
+    return 1
+  fi
+
+  mapfile -t ids < <(jq -r '.[]' <<<"$changed")
+  if [ "$DRY_RUN" = true ]; then
+    log "would push ${#ids[@]} bead(s): ${ids[*]}"
+    return 0
+  fi
+
+  log "pushing ${#ids[@]} bead(s): ${ids[*]}"
+  if ! out=$("$BD" github push "${ids[@]}" 2>&1); then
+    printf '%s\n' "$out" >&2
+    log "push failed; will retry"
+    return 2
+  fi
+  [ -n "$out" ] && printf '%s\n' "$out" >&2
+  if grep -qiE 'failed to (create|update|push)' <<<"$out"; then
+    log "push reported per-issue failures; will retry those beads"
+    return 2
+  fi
+
+  # Record what was pushed, using the fingerprints read *before* the push:
+  # a bead edited while the push ran still differs and goes out next pass.
+  save_state "$(jq -cn --argjson cur "$current" --argjson old "$previous" --argjson ids "$changed" '
+    ($old | with_entries(select($cur[.key] != null)))
+    + ($cur | with_entries(select(.key as $k | $ids | index($k))))')"
+
+  # bd github push records new issue links (external_ref) in the Dolt
+  # working set without committing; commit so `bd dolt push` carries them.
+  commit_dolt "bd-gh-watch: link GitHub issues" || log "could not commit issue links to Dolt"
+  if [ "$DOLT_SYNC" -gt 0 ]; then
+    if out=$("$BD" dolt push 2>&1); then
+      log "pushed beads to the Dolt remote"
+    else
+      printf '%s\n' "$out" >&2
+      log "bd dolt push failed; will retry after the next change"
+    fi
+  fi
+  return 0
+}
+
+run_pass() {
+  local rc=0
+  sync_pass || rc=$?
+  # Something was pushed: look once more right away for edits that landed
+  # while the push was running.
+  if [ "$rc" -eq 0 ] && [ "$DRY_RUN" != true ]; then
+    sync_pass || true
+  fi
+}
+
+if [ "$ONCE" = true ]; then
+  rc=0
+  sync_pass || rc=$?
+  [ "$rc" -eq 2 ] && exit 1
+  exit 0
+fi
+
+if [ "$BACKEND" = auto ]; then
+  if command -v inotifywait >/dev/null; then BACKEND=inotify
+  elif command -v fswatch >/dev/null; then BACKEND=fswatch
+  else BACKEND=poll
+  fi
+fi
+
+# Paths whose changes are not bead writes: our state, exports, logs, locks.
+IGNORE='(\.jsonl|\.log|\.lock|\.pid|\.port|/last-touched|/bd\.sock.*|\.activity)$'
+
+watch_events() {
+  case $BACKEND in
+    inotify)
+      exec inotifywait -m -r -q -e close_write,moved_to,create,delete \
+        --exclude "$IGNORE" --format '%w%f' "$BEADS_DIR" ;;
+    fswatch)
+      exec fswatch -r -e "$IGNORE" "$BEADS_DIR" ;;
+    poll)
+      # No event source: the main loop's poll timeout does all the work.
+      while :; do sleep 3600; done ;;
+    *) die "unknown backend: $BACKEND" ;;
+  esac
+}
+
+if [ "$DOLT_SYNC" -gt 0 ] && [ "$DOLT_SYNC" -lt "$POLL" ]; then
+  POLL=$DOLT_SYNC
+fi
+LAST_DOLT_PULL=$SECONDS
+
+dolt_pull() {
+  [ "$DOLT_SYNC" -gt 0 ] && [ $((SECONDS - LAST_DOLT_PULL)) -ge "$DOLT_SYNC" ] || return 0
+  LAST_DOLT_PULL=$SECONDS
+  local out
+  # Commit first so a pending working set never blocks the merge.
+  commit_dolt "bd-gh-watch: local changes" || true
+  out=$("$BD" dolt pull 2>&1) || { printf '%s\n' "$out" >&2; log "bd dolt pull failed"; }
+}
+
+log "watching $BEADS_DIR (backend: $BACKEND, poll: ${POLL}s, dolt sync: ${DOLT_SYNC}s)"
+WATCH_PID=
+trap '[ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null' EXIT
+trap 'exit 0' INT TERM
+
+start_watch() { exec 3< <(watch_events); WATCH_PID=$!; }
+
+# Drain queued events until the stream has been quiet for $1 seconds (capped
+# at 10s so a constantly busy database cannot starve the watcher). Our own
+# bd invocations touch the Dolt files even when they only read, so whatever
+# arrives right after a pass is ours; a user edit swallowed here is picked up
+# by the next poll.
+drain() {
+  local deadline=$((SECONDS + 10))
+  while [ "$SECONDS" -lt "$deadline" ] && read -r -t "$1" _ <&3; do :; done
+}
+
+start_watch
+run_pass
+drain 0.5
+while true; do
+  if read -r -t "$POLL" _ <&3; then
+    drain "$DEBOUNCE"       # wait until the burst of writes settles
+  else
+    rc=$?
+    # >128 is a timeout (the safety-net poll); anything else means the
+    # event source died, so fall back to polling.
+    if [ "$rc" -le 128 ] && [ "$BACKEND" != poll ]; then
+      log "file watcher exited; falling back to polling every ${POLL}s"
+      BACKEND=poll
+      start_watch
+    fi
+  fi
+  dolt_pull
+  run_pass
+  drain 0.5
+done
