@@ -73,3 +73,5 @@
 
 sync:
     remote: "git+https://github.com/Takashiidobe/bd-gh-sync"
+export:
+    auto: true
