@@ -1,13 +1,18 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct Workdir {
@@ -87,6 +92,9 @@ pub struct Bead {
     pub labels: Option<Vec<String>>,
     pub assignee: Option<String>,
     pub external_ref: Option<String>,
+    pub estimate: Option<i64>,
+    pub defer_until: Option<String>,
+    pub updated_at: Option<String>,
     pub comments: Option<Vec<Comment>>,
     pub dependencies: Option<Vec<Dependency>>,
 }
@@ -156,6 +164,7 @@ pub fn parse_export(text: &str) -> Result<Vec<Bead>> {
 pub struct Bd<'a> {
     wd: &'a Workdir,
     bin: String,
+    export_cache: Mutex<Option<String>>,
 }
 
 static TEMP_FILES: AtomicU64 = AtomicU64::new(0);
@@ -165,19 +174,59 @@ impl<'a> Bd<'a> {
         Self {
             wd,
             bin: std::env::var("BD").unwrap_or_else(|_| "bd".into()),
+            export_cache: Mutex::new(None),
         }
     }
 
     pub async fn run(&self, args: &[&str]) -> Result<String> {
-        self.wd.run(&self.bin, args).await
+        if !matches!(args.first(), Some(&"export" | &"config" | &"kv")) {
+            *self.export_cache.lock().expect("export cache poisoned") = None;
+        }
+        let started = Instant::now();
+        let result = self.wd.run(&self.bin, args).await;
+        info!(
+            command = args.first().copied().unwrap_or_default(),
+            subcommand = args.get(1).copied().unwrap_or_default(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "bd command completed"
+        );
+        result
     }
 
     pub async fn output(&self, args: &[&str]) -> Result<Output> {
-        self.wd.output(&self.bin, args).await
+        if !matches!(args.first(), Some(&"export" | &"config" | &"kv")) {
+            *self.export_cache.lock().expect("export cache poisoned") = None;
+        }
+        let started = Instant::now();
+        let result = self.wd.output(&self.bin, args).await;
+        info!(
+            command = args.first().copied().unwrap_or_default(),
+            subcommand = args.get(1).copied().unwrap_or_default(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "bd command completed"
+        );
+        result
     }
 
     pub async fn export_raw(&self) -> Result<String> {
-        self.run(&["export"]).await
+        if let Some(export) = self
+            .export_cache
+            .lock()
+            .expect("export cache poisoned")
+            .clone()
+        {
+            info!("reused bd export within sync pass");
+            return Ok(export);
+        }
+        let started = Instant::now();
+        let export = self.wd.run(&self.bin, &["export"]).await?;
+        info!(
+            command = "export",
+            elapsed_ms = started.elapsed().as_millis(),
+            "bd command completed"
+        );
+        *self.export_cache.lock().expect("export cache poisoned") = Some(export.clone());
+        Ok(export)
     }
 
     pub async fn export(&self) -> Result<Vec<Bead>> {
@@ -197,6 +246,11 @@ impl<'a> Bd<'a> {
     }
 
     pub async fn bootstrap(&self) -> Result<()> {
+        let beads = self.wd.dir.join(".beads");
+        if beads.join("metadata.json").is_file() && beads.join("embeddeddolt").is_dir() {
+            info!("skipping bd bootstrap for initialized embedded Dolt clone");
+            return Ok(());
+        }
         self.run(&["bootstrap", "--yes"]).await.map(drop)
     }
 
@@ -284,6 +338,13 @@ impl<'a> Bd<'a> {
 
     pub async fn set_status(&self, id: &str, status: &str) -> Result<()> {
         self.run(&["update", id, "-s", status]).await.map(drop)
+    }
+
+    pub async fn update_fields(&self, id: &str, fields: &[String]) -> Result<()> {
+        let mut args = vec!["update".to_string(), id.to_string()];
+        args.extend(fields.iter().cloned());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(&refs).await.map(drop)
     }
 
     pub async fn label_add(&self, id: &str, label: &str) -> Result<()> {

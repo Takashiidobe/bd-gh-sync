@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -77,10 +77,16 @@ pub async fn run(wd: &Workdir, gh: &GitHub, opts: &Options) -> Result<()> {
             .join(opts.jsonl.parent().unwrap_or(Path::new("")))
             .join("github-sync.json"),
     };
-    match transport {
+    let started = Instant::now();
+    let result = match transport {
         Transport::Dolt => sync.via_dolt().await,
         _ => sync.via_jsonl().await,
-    }
+    };
+    info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "sync pass completed"
+    );
+    result
 }
 
 async fn resolve_transport(wd: &Workdir, bd: &Bd<'_>, wanted: Transport) -> Result<Transport> {

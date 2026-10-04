@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::{
@@ -145,7 +145,28 @@ impl Project {
                 adopt_bd_created: false,
                 commit_message: "beads: sync from GitHub".into(),
             };
-            sync::run(&wd, &GitHub::new(&config.api_url, &secrets.token), &opts).await
+            sync::run(&wd, &GitHub::new(&config.api_url, &secrets.token), &opts).await?;
+            let mut project_changed = false;
+            for project_config in config
+                .project_sync
+                .iter()
+                .filter(|entry| entry.repo.eq_ignore_ascii_case(&self.repo))
+            {
+                let token = secrets
+                    .projects_token
+                    .as_deref()
+                    .context("GITHUB_PROJECTS_TOKEN is required when project_sync is configured")?;
+                project_changed |= crate::server::projects::sync(
+                    &wd,
+                    &GitHub::new(&config.api_url, token),
+                    project_config,
+                )
+                .await?;
+            }
+            if project_changed {
+                crate::server::projects::publish(&wd, config).await?;
+            }
+            Ok(())
         }
         .instrument(span)
         .await

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -29,6 +30,21 @@ pub struct Config {
     pub git_base: String,
     #[serde(default = "default_api_url")]
     pub api_url: String,
+    #[serde(default)]
+    pub project_sync: Vec<ProjectSync>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSync {
+    pub repo: String,
+    pub project_id: String,
+    pub status_field: String,
+    pub status: BTreeMap<String, String>,
+    pub priority_field: String,
+    pub priority: BTreeMap<String, String>,
+    pub estimate_field: Option<String>,
+    pub iteration_field: Option<String>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -91,6 +107,7 @@ impl Config {
 
 pub struct Secrets {
     pub token: String,
+    pub projects_token: Option<String>,
     pub webhook_secret: String,
 }
 
@@ -106,6 +123,9 @@ impl Secrets {
         }
         Ok(Self {
             token,
+            projects_token: std::env::var("GITHUB_PROJECTS_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty()),
             webhook_secret,
         })
     }

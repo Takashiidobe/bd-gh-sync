@@ -19,6 +19,7 @@ pub fn verify(secret: &[u8], body: &[u8], header: Option<&str>) -> bool {
 #[derive(Debug, PartialEq)]
 pub enum Event {
     Ping,
+    Projects,
     Sync { repo: String, issues: BTreeSet<u64> },
     Reconcile { repo: String },
     Ignored(String),
@@ -27,6 +28,9 @@ pub enum Event {
 pub fn parse(event: &str, payload: &Value) -> Event {
     if event == "ping" {
         return Event::Ping;
+    }
+    if event == "projects_v2_item" {
+        return Event::Projects;
     }
     let Some(repo) = payload["repository"]["full_name"].as_str() else {
         return Event::Ignored("no repository in payload".into());

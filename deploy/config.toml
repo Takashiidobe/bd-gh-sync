@@ -9,3 +9,16 @@ public_url = "https://sync.example.com"
 # max_wait_ms = 10000                # sync anyway after this long in a burst
 # reconcile_minutes = 60             # sync every project this often regardless
 # transport = "auto"                 # "dolt", "jsonl" or "auto"
+
+# Optional GitHub Projects v2 field sync. Add one block per repo/project pair.
+# Status and priority map Beads values to GitHub single-select option names.
+# Estimate maps to a numeric field; iteration maps to the Beads defer date.
+# [[project_sync]]
+# repo = "owner/repo"
+# project_id = "PVT_kwDO..."
+# status_field = "Status"
+# status = { open = "Todo", in_progress = "In Progress", closed = "Done" }
+# priority_field = "Priority"
+# priority = { "0" = "Urgent", "1" = "High", "2" = "Medium", "3" = "Low", "4" = "Backlog" }
+# estimate_field = "Estimate"
+# iteration_field = "Iteration"

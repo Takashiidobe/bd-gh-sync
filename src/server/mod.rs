@@ -1,11 +1,12 @@
 pub mod config;
 pub mod project;
+pub mod projects;
 pub mod webhook;
 pub mod worker;
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use axum::{
     Router,
     body::Bytes,
@@ -32,13 +33,16 @@ pub fn list(config: &Config) -> Result<()> {
 }
 
 pub async fn sync(config: Config, repo: &str, mode: Mode) -> Result<()> {
+    let secrets = Secrets::from_env()?;
+    require_projects_token(&config, &secrets)?;
     let project = Project::find(&config.data_dir, repo)?
         .with_context(|| format!("{repo} is not a project here; run `server add` first"))?;
-    project.sync(&config, &Secrets::from_env()?, mode).await
+    project.sync(&config, &secrets, mode).await
 }
 
 pub async fn add(config: Config, repo: &str, no_webhook: bool) -> Result<()> {
     let secrets = Secrets::from_env()?;
+    require_projects_token(&config, &secrets)?;
     let webhook_url = if no_webhook {
         None
     } else {
@@ -68,6 +72,7 @@ pub async fn add(config: Config, repo: &str, no_webhook: bool) -> Result<()> {
 
 pub async fn serve(config: Config) -> Result<()> {
     let secrets = Secrets::from_env()?;
+    require_projects_token(&config, &secrets)?;
     let listen = config.listen;
     let workers = Arc::new(Workers::new(Arc::new(Context { config, secrets })));
 
@@ -102,6 +107,13 @@ pub async fn serve(config: Config) -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
+    Ok(())
+}
+
+fn require_projects_token(config: &Config, secrets: &Secrets) -> Result<()> {
+    if !config.project_sync.is_empty() && secrets.projects_token.is_none() {
+        bail!("GITHUB_PROJECTS_TOKEN is required when project_sync is configured");
+    }
     Ok(())
 }
 
@@ -145,6 +157,23 @@ fn handle(
 ) -> Result<(StatusCode, String)> {
     let (repo, job) = match webhook::parse(event, payload) {
         Event::Ping => return Ok((StatusCode::OK, "pong".into())),
+        Event::Projects => {
+            let mut queued = std::collections::BTreeSet::new();
+            for entry in &workers.context().config.project_sync {
+                if !queued.insert(entry.repo.to_lowercase()) {
+                    continue;
+                }
+                if let Some(project) =
+                    Project::find(&workers.context().config.data_dir, &entry.repo)?
+                {
+                    workers.submit(&project, Job::SinceLast);
+                }
+            }
+            return Ok((
+                StatusCode::ACCEPTED,
+                "queued configured project syncs".into(),
+            ));
+        }
         Event::Ignored(why) => return Ok((StatusCode::ACCEPTED, format!("ignored: {why}"))),
         Event::Sync { repo, issues } => (repo, Job::Issues(issues)),
         Event::Reconcile { repo } => (repo, Job::SinceLast),

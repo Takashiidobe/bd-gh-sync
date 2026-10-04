@@ -174,14 +174,37 @@ schedules. `journalctl -u bd-gh-sync -f` shows each sync.
 To debug one project, stop the service and run
 `as-sync server sync owner/repo [NUMBER...] [--all]`.
 
+### GitHub Projects v2 fields
+
+Project fields are opt-in because each repository can use a different board.
+Add a `[[project_sync]]` block to `/etc/bd-gh-sync/config.toml` with the repo,
+project node ID, Status and Priority field names, and mappings from Beads values
+to the board's single-select option names. `estimate_field` maps a numeric
+Estimate field to the Beads estimate in minutes. `iteration_field` maps the
+selected iteration's final day to the Beads defer date and matches deferred
+beads back to an iteration. See [`deploy/config.toml`](deploy/config.toml) for
+the full shape. Set `GITHUB_PROJECTS_TOKEN` to a separate token or App token
+with read/write access to Projects; `GITHUB_TOKEN` continues to serve repository
+issue sync.
+
+GitHub's [`projects_v2_item` event](https://docs.github.com/en/webhooks/webhook-events-and-payloads#projects_v2_item)
+applies to organization projects. A GitHub App subscribing to it needs Projects
+read permission. Configure an organization webhook or App to send that event to
+the same `/webhook` URL and use the same webhook secret. The receiver queues
+every configured project repository; the hourly reconcile also catches missed
+events. Project fields use the newer
+of the Beads issue update and GitHub field update when both sides have a value.
+The item must be a linked issue in the configured repository. Draft items and
+items without a linked bead are skipped.
+
 ## Sync loops
 
 A change must never bounce between the two sides. The guards:
 
-1. **The Action and the server only pull.** They never write to GitHub issues,
-   so they cannot generate issue events. They publish nothing when the pull
-   changed nothing, and the Action publishes with `GITHUB_TOKEN`, whose pushes
-   never start workflows.
+1. **Issue sync only pulls.** The Action and server do not write to GitHub
+   issues. Configured Project v2 sync writes mapped board fields, and repeated
+   project events are harmless because equal field values are skipped. The
+   Action publishes with `GITHUB_TOKEN`, whose pushes never start workflows.
 2. **The watcher pushes only real edits.** It fingerprints the fields a push
    sends (title, description, status, priority, type, labels) and pushes only
    beads whose fingerprint changed since their last push. bd's own write-back
