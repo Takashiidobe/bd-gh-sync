@@ -61,13 +61,10 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
-```bash
-# Example:
-# npm install
-# npm test
-```
+Do not write unit tests or end-to-end test suites for now. The project is still
+changing too fast; the server gets tested end to end by hand as features land.
+Once things are stable, add tests deliberately. Verify changes with
+`cargo clippy --all-targets -- -D warnings` and by running the tool.
 
 ## Architecture Overview
 

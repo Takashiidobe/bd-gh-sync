@@ -110,30 +110,3 @@ impl Secrets {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_config_uses_defaults() {
-        let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.listen, default_listen());
-        assert_eq!(config.transport, Transport::Auto);
-        assert!(config.webhook_url().is_err());
-    }
-
-    #[test]
-    fn webhook_url_drops_trailing_slash() {
-        let config: Config = toml::from_str("public_url = \"https://sync.example.com/\"").unwrap();
-        assert_eq!(
-            config.webhook_url().unwrap(),
-            "https://sync.example.com/webhook"
-        );
-    }
-
-    #[test]
-    fn unknown_keys_are_rejected() {
-        assert!(toml::from_str::<Config>("listn = \"0.0.0.0:1\"").is_err());
-    }
-}

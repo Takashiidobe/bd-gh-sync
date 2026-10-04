@@ -2,6 +2,7 @@
 name = "bd-gh-sync"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Real-time two-way sync between beads (bd) and GitHub issues"
 
 [dependencies]
@@ -20,6 +21,3 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }

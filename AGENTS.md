@@ -23,6 +23,13 @@ bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
 
+## Testing
+
+Do not write unit tests or end-to-end test suites for now. The project is still
+changing too fast; the server gets tested end to end by hand as features land.
+Once things are stable, add tests deliberately. Verify changes with
+`cargo clippy --all-targets -- -D warnings` and by running the tool.
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.

@@ -1,0 +1,30 @@
+[Unit]
+Description=bd-gh-sync webhook server (GitHub issues <-> beads)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=bd-gh-sync
+Group=bd-gh-sync
+EnvironmentFile=/etc/bd-gh-sync/env
+Environment=HOME=/var/lib/bd-gh-sync
+ExecStart=/usr/local/bin/bd-gh-sync server --config /etc/bd-gh-sync/config.toml serve
+Restart=on-failure
+RestartSec=5
+
+StateDirectory=bd-gh-sync
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

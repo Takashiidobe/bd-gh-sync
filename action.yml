@@ -13,7 +13,7 @@ inputs:
     description: >-
       Space-separated issue numbers to pull, "since" for every issue updated
       since the last sync, or "all" to reconcile every issue. Defaults to
-      "since" for `issues`, `issue_comment` and `schedule` events, and "all"
+      "since" for `issues`, `issue_comment`, `pull_request` and `schedule` events, and "all"
       for `workflow_dispatch`.
     required: false
     default: ""
@@ -24,6 +24,12 @@ inputs:
       workflows, which keeps the sync from looping.
     required: false
     default: ${{ github.token }}
+  version:
+    description: >-
+      bd-gh-sync release to run ("latest" or a tag such as v0.1.0), downloaded
+      from github.com/Takashiidobe/bd-gh-sync releases.
+    required: false
+    default: latest
   bd-version:
     description: beads release to install (downloaded from github.com/gastownhall/beads releases).
     required: false
@@ -66,6 +72,12 @@ runs:
           "$GITHUB_ACTION_PATH/scripts/install-bd.sh" "$BD_VERSION" "$RUNNER_TEMP/beads-bin"
         fi
 
+    - name: Install bd-gh-sync
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: '"$GITHUB_ACTION_PATH/scripts/install-bd-gh-sync.sh" "$VERSION" "$RUNNER_TEMP/bd-gh-sync-bin"'
+
     - name: Pick issues to sync
       id: pick
       shell: bash
@@ -76,7 +88,7 @@ runs:
         issues=$INPUT_ISSUES
         if [ -z "$issues" ]; then
           case $EVENT_NAME in
-            issues|issue_comment|schedule) issues=since ;;
+            issues|issue_comment|pull_request|schedule) issues=since ;;
             workflow_dispatch) issues=all ;;
           esac
         fi
@@ -102,11 +114,9 @@ runs:
           '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        if [ "$ISSUES" = all ]; then
-          "$GITHUB_ACTION_PATH/scripts/gh-to-beads.sh" --publish --all
-        elif [ "$ISSUES" = since ]; then
-          "$GITHUB_ACTION_PATH/scripts/gh-to-beads.sh" --publish --since-last
-        else
-          # shellcheck disable=SC2086
-          "$GITHUB_ACTION_PATH/scripts/gh-to-beads.sh" --publish $ISSUES
-        fi
+        case $ISSUES in
+          all) args=(--all) ;;
+          since) args=(--since-last) ;;
+          *) read -ra args <<<"$ISSUES" ;;
+        esac
+        bd-gh-sync sync --publish "${args[@]}"

@@ -159,35 +159,3 @@ fn restrict_beads_dir(dir: &Path) {
         let _ = std::fs::set_permissions(&beads, std::fs::Permissions::from_mode(0o700));
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repo_names() {
-        assert!(validate_repo("acme/widgets").is_ok());
-        assert!(validate_repo("Acme-Co/my_repo.rs").is_ok());
-        for bad in [
-            "acme", "acme/", "/widgets", "a/b/c", "../etc", "acme/..", "acme/w x",
-        ] {
-            assert!(validate_repo(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn discovers_clones_only() {
-        let dir = std::env::temp_dir().join(format!("bd-gh-sync-test-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("acme/widgets/.git")).unwrap();
-        std::fs::create_dir_all(dir.join("acme/not-a-clone")).unwrap();
-        std::fs::create_dir_all(dir.join(".bd-gh-sync")).unwrap();
-        let found: Vec<_> = Project::discover(&dir)
-            .unwrap()
-            .into_iter()
-            .map(|p| p.repo)
-            .collect();
-        assert_eq!(found, ["acme/widgets"]);
-        assert!(Project::find(&dir, "ACME/Widgets").unwrap().is_some());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-}

@@ -8,6 +8,7 @@ pub const WEBHOOK_EVENTS: &[&str] = &[
     "sub_issues",
     "issue_dependencies",
     "issue_relates_to",
+    "pull_request",
 ];
 
 pub const DEFAULT_API_URL: &str = "https://api.github.com";
@@ -124,6 +125,24 @@ impl GitHub {
         Ok(items)
     }
 
+    pub async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let resp = self
+            .request(Method::POST, &self.graphql_url())
+            .json(&json!({"query": query, "variables": variables}))
+            .send()
+            .await
+            .context("GraphQL request")?;
+        let status = resp.status();
+        let body: Value = resp.json().await.context("GraphQL response")?;
+        if !status.is_success() || body.get("errors").is_some_and(|e| !e.is_null()) {
+            bail!(
+                "GraphQL: HTTP {status}: {}",
+                body.get("errors").unwrap_or(&body)
+            );
+        }
+        Ok(body["data"].clone())
+    }
+
     pub async fn graphql_nodes(
         &self,
         query: &str,
@@ -135,21 +154,8 @@ impl GitHub {
         loop {
             let mut vars = variables.clone();
             vars["endCursor"] = cursor;
-            let resp = self
-                .request(Method::POST, &self.graphql_url())
-                .json(&json!({"query": query, "variables": vars}))
-                .send()
-                .await
-                .context("GraphQL request")?;
-            let status = resp.status();
-            let body: Value = resp.json().await.context("GraphQL response")?;
-            if !status.is_success() || body.get("errors").is_some_and(|e| !e.is_null()) {
-                bail!(
-                    "GraphQL: HTTP {status}: {}",
-                    body.get("errors").unwrap_or(&body)
-                );
-            }
-            let mut connection = &body["data"];
+            let data = self.graphql(query, vars).await?;
+            let mut connection = &data;
             for key in path {
                 connection = &connection[*key];
             }
@@ -229,31 +235,4 @@ pub async fn register_webhook(
         );
     }
     Ok(outcome)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_link_headers() {
-        let header = r#"<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=5>; rel="last""#;
-        assert_eq!(
-            next_link(header).as_deref(),
-            Some("https://api.github.com/x?page=2")
-        );
-        assert_eq!(next_link(r#"<https://a/x?page=1>; rel="prev""#), None);
-    }
-
-    #[test]
-    fn graphql_url_for_enterprise() {
-        assert_eq!(
-            GitHub::new("https://api.github.com", "t").graphql_url(),
-            "https://api.github.com/graphql"
-        );
-        assert_eq!(
-            GitHub::new("https://ghe.example.com/api/v3/", "t").graphql_url(),
-            "https://ghe.example.com/api/graphql"
-        );
-    }
 }

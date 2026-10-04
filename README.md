@@ -4,12 +4,13 @@ Real-time, two-way sync between [beads](https://github.com/gastownhall/beads)
 (`bd`) and GitHub issues.
 
 beads (v0.60+) already knows how to sync with GitHub, but only when someone runs
-`bd github push` or `bd github pull`. This repo runs those commands for you, the
-moment something changes:
+`bd github push` or `bd github pull`. This repo's `bd-gh-sync` binary runs those
+commands for you, the moment something changes:
 
 | Direction | What runs | When |
 |---|---|---|
-| GitHub → beads | a GitHub Action ([`action.yml`](action.yml)) running `bd github pull` for every issue updated since its last sync | a minute after the last of a burst of `issues` / `issue_comment` events, every 15 minutes, and a full reconcile every 6 hours |
+| GitHub → beads | a webhook server (`bd-gh-sync server`) on an always-on machine, for any number of repositories | a couple of seconds after the last of a burst of issue, comment, sub-issue or blocked-by changes |
+| GitHub → beads | or a GitHub Action ([`action.yml`](action.yml)) running `bd github pull` for every issue updated since its last sync | a minute after the last of a burst of `issues` / `issue_comment` events, every 15 minutes, and a full reconcile every 6 hours |
 | beads → GitHub | a local watcher (`bd-gh-sync watch`) running `bd github push <ids>` | within a second or two of a local bead change |
 
 What syncs, both ways:
@@ -19,9 +20,13 @@ What syncs, both ways:
 | title, body, open/closed | title, description, status |
 | labels (`priority::`, `type::`, `status::` scoped) | labels, priority, type, status |
 | first assignee (login) | assignee |
+| close reason (`completed`, `not_planned`, `duplicate`) | close reason (`Completed`, `Not planned`, `Duplicate`) |
+| closed as duplicate of #N | closed bead with a `supersedes` dependency on #N's bead |
 | comments | comments |
 | sub-issue of #N | `parent-child` dependency on #N's bead |
 | blocked by #N | `blocks` dependency on #N's bead |
+| mention of #N (`Ref: #N`), GitHub to beads only | `related` dependency on #N's bead |
+| open pull request that closes the issue (`Fixes #N`), GitHub to beads only | bead goes `in_progress` and gets a "Linked pull request" comment |
 
 ```
  GitHub issue edited ──issues event──▶ Action: bd github pull N ──▶ bd dolt push (or commit issues.jsonl)
@@ -57,11 +62,17 @@ The Action keeps a little state with the beads: the time of the last sync and
 the relations it saw on GitHub then (`bd kv get bd-gh-sync.since` /
 `bd-gh-sync.relations` for Dolt, `.beads/github-sync.json` for JSONL).
 
-### 2. Add the workflow
+### 2. Pull GitHub changes: the Action or the server
+
+Use the [webhook server](#webhook-server) if you have an always-on machine: it
+is faster and sees sub-issue and blocked-by changes as they happen. Otherwise
+add the workflow:
 
 Copy [`.github/workflows/beads-sync.yml`](.github/workflows/beads-sync.yml) into
 your repository and change `uses: ./` to `uses: Takashiidobe/bd-gh-sync@main`.
-It needs `contents: write` (to publish the beads) and `issues: read`.
+It needs `contents: write` (to publish the beads) and `issues: read`. The
+Action downloads a `bd-gh-sync` release binary for the runner (Linux x86_64 or
+aarch64, macOS aarch64).
 
 The workflow batches. Each issue or comment event starts a `debounce` job that
 sleeps for a minute; a newer event cancels the waiting one (those runs show up
@@ -76,6 +87,7 @@ Action inputs:
 | Input | Default | Meaning |
 |---|---|---|
 | `issues` | `since` for events and schedules, `all` on dispatch | issue numbers to pull, `since` (updated since the last sync), or `all` |
+| `version` | `latest` | `bd-gh-sync` release to run, e.g. `v0.1.0` |
 | `token` | `github.token` | token for reading issues and publishing |
 | `transport` | `auto` | `dolt`, `jsonl` or `auto` (see above) |
 | `bd-version` | `1.3.1` | beads release to install (from the GitHub release) |
@@ -86,7 +98,7 @@ Action inputs:
 ### 3. Run the watcher locally
 
 ```sh
-cargo install --git https://github.com/Takashiidobe/bd-gh-sync
+scripts/install-bd-gh-sync.sh                # or: cargo install --git https://github.com/Takashiidobe/bd-gh-sync
 bd config set github.repository owner/repo   # once per clone
 export GITHUB_TOKEN=...                      # or be logged in with `gh auth login`
 bd-gh-sync watch --dolt-sync 30
@@ -110,14 +122,66 @@ The watcher keeps its per-clone state in `.git/bd-gh-sync/`, so it catches up on
 changes made while it was stopped (one watcher per clone; a second one refuses
 to start). It talks to the GitHub REST API directly for assignees, comments and relations (`GITHUB_API_URL` for GitHub Enterprise).
 
+## Webhook server
+
+One always-on machine (a small VM is plenty) can keep many repositories in
+sync. Each project is a clone under `/var/lib/bd-gh-sync/<owner>/<name>`;
+GitHub webhooks queue syncs, which are debounced per project (2s quiet, at most
+10s) and run one at a time per project. Every project is also reconciled at
+startup and hourly, so a missed webhook costs at most an hour. The server only
+pulls, like the Action; local bead changes still reach GitHub through
+`bd-gh-sync watch`.
+
+### Install (Debian/Ubuntu, as root, from a checkout of this repo)
+
+```sh
+apt-get install -y git caddy
+useradd --system --home-dir /var/lib/bd-gh-sync --shell /usr/sbin/nologin bd-gh-sync
+scripts/install-bd.sh 1.3.1 /usr/local/bin
+scripts/install-bd-gh-sync.sh latest /usr/local/bin
+
+install -d -m 0750 -g bd-gh-sync /etc/bd-gh-sync
+install -m 0640 -g bd-gh-sync deploy/env.example /etc/bd-gh-sync/env   # fill in
+install -m 0644 deploy/config.toml /etc/bd-gh-sync/config.toml          # set public_url
+install -m 0644 deploy/bd-gh-sync.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now bd-gh-sync
+```
+
+[`deploy/env.example`](deploy/env.example) lists the token permissions. For
+HTTPS, add [`deploy/Caddyfile`](deploy/Caddyfile) (with your domain) to
+`/etc/caddy/Caddyfile`, point the domain's DNS at the machine, open ports 80
+and 443 (on Hetzner, in the Cloud Firewall too), and `systemctl reload caddy`.
+`curl https://<domain>/healthz` should print `ok`.
+
+### Add projects
+
+Run admin commands as the service user, with its environment:
+
+```sh
+as-sync() { sudo -u bd-gh-sync sh -c 'set -a; . /etc/bd-gh-sync/env; HOME=/var/lib/bd-gh-sync exec bd-gh-sync "$@"' sh "$@"; }
+
+as-sync server add owner/repo    # clone, sync once, create the repository webhook
+as-sync server list
+```
+
+`server add` is safe to re-run; it updates the webhook instead of adding a
+second one. The repository's beads must already be published (`bd dolt push`
+once from a clone, or a committed JSONL export). Once a repository is on the
+server, delete its `beads-sync.yml` workflow: the hourly reconcile replaces the
+schedules. `journalctl -u bd-gh-sync -f` shows each sync.
+
+To debug one project, stop the service and run
+`as-sync server sync owner/repo [NUMBER...] [--all]`.
+
 ## Sync loops
 
-A change must never bounce between the two sides. The guards, and the test in
-[`tests/run.sh`](tests/run.sh) that proves each one:
+A change must never bounce between the two sides. The guards:
 
-1. **The Action only pulls.** It never writes to GitHub issues, so it cannot
-   generate issue events. It publishes with `GITHUB_TOKEN`, whose pushes never
-   start workflows, and publishes nothing when the pull changed nothing.
+1. **The Action and the server only pull.** They never write to GitHub issues,
+   so they cannot generate issue events. They publish nothing when the pull
+   changed nothing, and the Action publishes with `GITHUB_TOKEN`, whose pushes
+   never start workflows.
 2. **The watcher pushes only real edits.** It fingerprints the fields a push
    sends (title, description, status, priority, type, labels) and pushes only
    beads whose fingerprint changed since their last push. bd's own write-back
@@ -160,8 +224,43 @@ no-op, and then everything is quiet.
 - A bead's assignee must be a GitHub login to reach GitHub; the watcher logs
   and skips one that GitHub refuses. A bead holds one assignee, so setting it
   locally replaces the issue's assignees with that one login.
-- Comments sync when created. Edits and deletions of existing comments don't
-  sync, and comments the watcher posts appear under the token's owner.
+- A bead's close reason maps to GitHub's by keyword: "duplicate" closes as
+  `duplicate`; "won't", "wont", "not planned" or "invalid" close as
+  `not_planned`; anything else is `completed`. On pull, a bead's reason is only
+  replaced when it implies a different GitHub reason, so custom text such as
+  "fixed in v2" survives.
+- Cross-references become `related` links once, when first seen. They are not
+  pushed back, and a pair that already has any other dependency is skipped. A
+  link you delete in beads is not re-added.
+- A pull request that closes an issue (`Fixes #N`, or linked in the sidebar)
+  moves an `open` bead to `in_progress` and adds a "Linked pull request: URL"
+  comment, once per pull request. The comment is not posted back to GitHub.
+  Merging closes the issue, and the normal sync closes the bead. A closed
+  unmerged pull request changes nothing. The status is not forced: if a later
+  pull of the issue resets the bead and no watcher has pushed `in_progress`
+  back, it stays `open`. The server reacts to `pull_request` webhook events; the
+  Action workflow triggers on `pull_request` too.
+- A bead that supersedes another bead (`bd supersede OLD --with NEW`) closes
+  OLD's issue on GitHub as a duplicate of NEW's, and a GitHub duplicate becomes
+  a `supersedes` link the other way. GitHub's REST API cannot set the target, so
+  this goes through GraphQL (`closeIssue` with `duplicateIssueId`). Only
+  duplicates within the repository map.
+- Deleting a bead closes its issue on GitHub as `not_planned` (the watcher
+  remembers each bead's issue and confirms with `bd show` that it is really
+  gone). An issue deleted on GitHub closes its bead ("Issue deleted on GitHub")
+  and labels it `github-deleted`; one transferred to another repository gets
+  its `external_ref` pointed at the new URL and the label `github-transferred`.
+  The watcher stops pushing beads with either label, since their issue is no
+  longer in this repository. Only a full reconcile (`--all`, or the issue's own
+  webhook event) notices a deleted or moved issue; `--since-last` cannot.
+- Comments sync when created, and comments the watcher posts appear under the
+  token's owner. `bd` cannot edit or delete a comment, so a GitHub edit or
+  deletion arrives as a new bead comment (`Edited on GitHub: <new text>`,
+  `Deleted on GitHub: a comment by <author>`) and the original stays as history.
+  These notes are never posted back to GitHub, and bead comments never change
+  GitHub comments. The pull tracks each GitHub comment's id and text (in the
+  same state as `since`), so comments imported before this existed are treated
+  as already seen.
 - Only `parent-child` and `blocks` dependencies map to GitHub. GitHub allows
   one parent per issue, so a bead's second parent is refused (and logged).
   Relations to issues in other repositories are ignored.
@@ -176,8 +275,10 @@ no-op, and then everything is quiet.
 ## Development
 
 ```sh
-tests/run.sh   # needs bd, jq, git, curl, python3; uses a fake GitHub API, no network
+cargo clippy --all-targets -- -D warnings
 ```
 
-[`tests/fake_github.py`](tests/fake_github.py) is a tiny in-memory GitHub issues
-API; `bd` talks to it through `GITHUB_API_URL`.
+There is no test suite yet.
+
+Releases: push a `v*` tag and [`release.yml`](.github/workflows/release.yml)
+builds and publishes the binaries the Action and the install script download.

@@ -1,0 +1,11 @@
+# /etc/bd-gh-sync/config.toml. Every key is optional; these are the defaults
+# except public_url, which `server add` needs to register webhooks.
+
+public_url = "https://sync.example.com"
+
+# listen = "127.0.0.1:8787"
+# data_dir = "/var/lib/bd-gh-sync"   # one clone per project: <data_dir>/<owner>/<name>
+# debounce_ms = 2000                 # quiet period that ends a burst of events
+# max_wait_ms = 10000                # sync anyway after this long in a burst
+# reconcile_minutes = 60             # sync every project this often regardless
+# transport = "auto"                 # "dolt", "jsonl" or "auto"

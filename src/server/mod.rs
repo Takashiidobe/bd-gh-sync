@@ -143,10 +143,11 @@ fn handle(
     event: &str,
     payload: &serde_json::Value,
 ) -> Result<(StatusCode, String)> {
-    let (repo, issues) = match webhook::parse(event, payload) {
+    let (repo, job) = match webhook::parse(event, payload) {
         Event::Ping => return Ok((StatusCode::OK, "pong".into())),
         Event::Ignored(why) => return Ok((StatusCode::ACCEPTED, format!("ignored: {why}"))),
-        Event::Sync { repo, issues } => (repo, issues),
+        Event::Sync { repo, issues } => (repo, Job::Issues(issues)),
+        Event::Reconcile { repo } => (repo, Job::SinceLast),
     };
     let Some(project) = Project::find(&workers.context().config.data_dir, &repo)? else {
         return Ok((
@@ -154,7 +155,7 @@ fn handle(
             format!("ignored: {repo} is not a project here"),
         ));
     };
-    info!(project = %project.repo, "{event}: queued {issues:?}");
-    workers.submit(&project, Job::Issues(issues));
+    info!(project = %project.repo, "{event}: queued {job:?}");
+    workers.submit(&project, job);
     Ok((StatusCode::ACCEPTED, "queued".into()))
 }

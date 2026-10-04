@@ -5,11 +5,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use reqwest::Method;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::{
-    bd::{Bd, Bead, Workdir},
+    bd::{Bd, Bead, DELETED_LABEL, MOVED_LABEL, Workdir},
     github::GitHub,
 };
 
@@ -40,6 +41,15 @@ pub struct Options {
 }
 
 pub const COMMENT_MARKER: &str = "<!-- bd-comment:";
+pub const LINKED_PR_COMMENT: &str = "Linked pull request:";
+const EDITED_COMMENT: &str = "Edited on GitHub:";
+const DELETED_COMMENT: &str = "Deleted on GitHub:";
+
+pub fn is_sync_note(text: &str) -> bool {
+    [LINKED_PR_COMMENT, EDITED_COMMENT, DELETED_COMMENT]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
 const ATTEMPTS: u32 = 5;
 
 pub async fn run(wd: &Workdir, gh: &GitHub, opts: &Options) -> Result<()> {
@@ -95,6 +105,18 @@ async fn resolve_transport(wd: &Workdir, bd: &Bd<'_>, wanted: Transport) -> Resu
     Ok(Transport::Jsonl)
 }
 
+struct GithubLinks {
+    relations: BTreeSet<String>,
+    mentions: BTreeSet<String>,
+    pulls: BTreeMap<String, (u64, String)>,
+    duplicates: BTreeMap<u64, u64>,
+}
+
+struct Pulled {
+    commented: Vec<u64>,
+    closed: BTreeMap<u64, String>,
+}
+
 struct Sync<'a> {
     wd: &'a Workdir,
     bd: Bd<'a>,
@@ -112,6 +134,7 @@ pub struct IssueInfo {
     pub is_pr: bool,
     pub bd_created: bool,
     pub comments: u64,
+    pub state_reason: Option<String>,
 }
 
 impl IssueInfo {
@@ -131,8 +154,22 @@ impl IssueInfo {
             is_pr: !issue["pull_request"].is_null(),
             bd_created: has("type::") && has("priority::"),
             comments: issue["comments"].as_u64().unwrap_or(0),
+            state_reason: (issue["state"] == "closed").then(|| {
+                issue["state_reason"]
+                    .as_str()
+                    .unwrap_or("completed")
+                    .to_string()
+            }),
         })
     }
+}
+
+fn is_here(issue: &Value, repo: &str, number: u64) -> bool {
+    issue["number"].as_u64() == Some(number)
+        && issue["repository_url"].as_str().is_none_or(|url| {
+            url.to_lowercase()
+                .ends_with(&format!("/repos/{}", repo.to_lowercase()))
+        })
 }
 
 pub fn issue_number(external_ref: &str, repo: &str) -> Option<u64> {
@@ -162,33 +199,100 @@ pub fn linked(beads: &[Bead], repo: &str) -> BTreeMap<u64, String> {
         .collect()
 }
 
+pub fn state_reason_for(close_reason: &str) -> &'static str {
+    let reason = close_reason.to_lowercase();
+    if reason.contains("duplicate") {
+        "duplicate"
+    } else if ["won't", "wont", "not planned", "not_planned", "invalid"]
+        .iter()
+        .any(|s| reason.contains(s))
+    {
+        "not_planned"
+    } else {
+        "completed"
+    }
+}
+
+fn close_reason_for(state_reason: &str) -> Option<&'static str> {
+    match state_reason {
+        "completed" => Some("Completed"),
+        "not_planned" => Some("Not planned"),
+        "duplicate" => Some("Duplicate"),
+        _ => None,
+    }
+}
+
 pub fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n").trim().to_string()
 }
 
-pub fn missing_comments(github: &[Value], bead: &[(String, String)]) -> Vec<(String, String)> {
+pub type Tracked = BTreeMap<u64, (String, String)>;
+
+#[derive(Debug, Default, PartialEq)]
+pub struct CommentPlan {
+    pub add: Vec<(u64, String, String)>,
+    pub edited: Vec<(u64, String, String)>,
+    pub deleted: Vec<(u64, String)>,
+    pub tracked: Tracked,
+}
+
+pub fn plan_comments(
+    github: &[Value],
+    bead: &[(String, String)],
+    tracked: &Tracked,
+) -> CommentPlan {
     let mut have: Vec<(String, String)> = bead
         .iter()
         .map(|(a, t)| (a.clone(), normalize(t)))
         .collect();
-    let mut missing = Vec::new();
-    for c in github {
-        let body = c["body"].as_str().unwrap_or_default();
-        if body.contains(COMMENT_MARKER) {
-            continue;
+    let mut consume = |key: &(String, String)| match have.iter().position(|h| h == key) {
+        Some(i) => {
+            have.remove(i);
+            true
         }
-        let key = (
-            c["user"]["login"].as_str().unwrap_or("ghost").to_string(),
-            normalize(body),
-        );
-        match have.iter().position(|h| *h == key) {
-            Some(i) => {
-                have.remove(i);
+        None => false,
+    };
+    let remote: Vec<(u64, String, String)> = github
+        .iter()
+        .filter_map(|c| {
+            let body = c["body"].as_str().unwrap_or_default();
+            if body.contains(COMMENT_MARKER) {
+                return None;
             }
-            None => missing.push(key),
+            Some((
+                c["id"].as_u64()?,
+                c["user"]["login"].as_str().unwrap_or("ghost").to_string(),
+                normalize(body),
+            ))
+        })
+        .collect();
+    let mut plan = CommentPlan::default();
+    for (id, author, text) in &remote {
+        if let Some((_, old)) = tracked.get(id) {
+            if old == text {
+                consume(&(author.clone(), text.clone()));
+            } else {
+                plan.edited.push((*id, author.clone(), text.clone()));
+            }
+            plan.tracked.insert(*id, (author.clone(), text.clone()));
         }
     }
-    missing
+    for (id, author, text) in &remote {
+        if tracked.contains_key(id) {
+            continue;
+        }
+        let key = (author.clone(), text.clone());
+        if !consume(&key) {
+            plan.add.push((*id, author.clone(), text.clone()));
+        }
+        plan.tracked.insert(*id, key);
+    }
+    plan.deleted = tracked
+        .iter()
+        .filter(|(id, _)| !remote.iter().any(|r| r.0 == **id))
+        .map(|(id, (author, _))| (*id, author.clone()))
+        .collect();
+    plan
 }
 
 #[derive(Debug, PartialEq)]
@@ -235,6 +339,17 @@ const RELATIONS_QUERY: &str = r#"query($owner: String!, $repo: String!, $endCurs
         number
         parent { number repository { nameWithOwner } }
         blockedBy(first: 100) { nodes { number repository { nameWithOwner } } }
+        duplicateOf { number repository { nameWithOwner } }
+        closedByPullRequestsReferences(first: 10, includeClosedPrs: false) {
+          nodes { url author { login } }
+        }
+        timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
+          nodes {
+            ... on CrossReferencedEvent {
+              source { ... on Issue { number repository { nameWithOwner } } }
+            }
+          }
+        }
       }
     }
   }
@@ -283,14 +398,29 @@ impl Sync<'_> {
         }
     }
 
-    async fn describe_issues(&self, since: Option<&str>) -> Result<Vec<IssueInfo>> {
+    async fn describe_issues(
+        &self,
+        since: Option<&str>,
+        linked: &BTreeMap<u64, String>,
+    ) -> Result<(Vec<IssueInfo>, Vec<u64>)> {
         let repo = self.repo();
+        let mut missing = Vec::new();
         let issues = match (&self.mode, since) {
             (Mode::Issues(numbers), _) => {
                 let mut issues = Vec::new();
                 for n in numbers {
-                    match self.gh.get(&format!("repos/{repo}/issues/{n}")).await {
-                        Ok(issue) => issues.push(issue),
+                    match self
+                        .gh
+                        .send(Method::GET, &format!("repos/{repo}/issues/{n}"), None)
+                        .await
+                    {
+                        Ok(resp) if resp.ok() && is_here(&resp.body, repo, *n) => {
+                            issues.push(resp.body)
+                        }
+                        Ok(resp) if resp.ok() || matches!(resp.status, 404 | 410) => {
+                            missing.push(*n)
+                        }
+                        Ok(resp) => warn!("#{n}: could not fetch (HTTP {}), skipping", resp.status),
                         Err(e) => warn!("#{n}: could not fetch, skipping: {e:#}"),
                     }
                 }
@@ -304,19 +434,95 @@ impl Sync<'_> {
                     .await?
             }
             (_, None) => {
-                self.gh
+                let issues = self
+                    .gh
                     .get_all(&format!("repos/{repo}/issues?state=all&per_page=100"))
-                    .await?
+                    .await?;
+                let listed: BTreeSet<u64> =
+                    issues.iter().filter_map(|i| i["number"].as_u64()).collect();
+                missing.extend(linked.keys().filter(|n| !listed.contains(n)));
+                issues
             }
         };
-        Ok(issues.iter().filter_map(IssueInfo::from_json).collect())
+        Ok((
+            issues.iter().filter_map(IssueInfo::from_json).collect(),
+            missing,
+        ))
     }
 
-    async fn pull_issues(&self, since: Option<&str>) -> Result<Vec<u64>> {
+    async fn resolve_gone(&self, missing: &[u64], linked: &BTreeMap<u64, String>) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let beads = self.bd.export().await?;
+        for n in missing {
+            let Some(bead) = linked
+                .get(n)
+                .and_then(|id| beads.iter().find(|b| &b.id == id))
+            else {
+                continue;
+            };
+            if bead.detached() {
+                continue;
+            }
+            let resp = match self
+                .gh
+                .send(
+                    Method::GET,
+                    &format!("repos/{}/issues/{n}", self.repo()),
+                    None,
+                )
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    warn!("#{n}: could not check whether it was deleted or moved: {e:#}");
+                    continue;
+                }
+            };
+            let id = &bead.id;
+            if matches!(resp.status, 404 | 410) {
+                let done = async {
+                    self.bd.label_add(id, DELETED_LABEL).await?;
+                    if !bead.is_closed() {
+                        self.bd
+                            .set_close_reason(id, "Issue deleted on GitHub")
+                            .await?;
+                    }
+                    anyhow::Ok(())
+                };
+                match done.await {
+                    Ok(()) => info!(
+                        "#{n} was deleted on GitHub: closed {id} and marked it {DELETED_LABEL}"
+                    ),
+                    Err(e) => warn!("#{n}: could not mark {id} as deleted: {e:#}"),
+                }
+            } else if resp.ok() && !is_here(&resp.body, self.repo(), *n) {
+                let Some(url) = resp.body["html_url"].as_str() else {
+                    continue;
+                };
+                let done = async {
+                    self.bd.set_external_ref(id, url).await?;
+                    self.bd.label_add(id, MOVED_LABEL).await
+                };
+                match done.await {
+                    Ok(()) => info!("#{n} was transferred to {url}: relinked {id}"),
+                    Err(e) => warn!("#{n}: could not relink {id} to {url}: {e:#}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn pull_issues(&self, since: Option<&str>) -> Result<Pulled> {
         let linked = linked(&self.bd.export().await?, self.repo());
         let mut to_pull = Vec::new();
         let mut commented = Vec::new();
-        for issue in self.describe_issues(since).await? {
+        let mut closed = BTreeMap::new();
+        let tracked = self.tracked_comments().await?;
+        let (issues, missing) = self.describe_issues(since, &linked).await?;
+        self.resolve_gone(&missing, &linked).await?;
+        for issue in issues {
             if issue.is_pr {
                 continue;
             }
@@ -331,13 +537,16 @@ impl Sync<'_> {
                 continue;
             }
             to_pull.push(issue.number);
-            if issue.comments > 0 {
+            if let Some(reason) = issue.state_reason {
+                closed.insert(issue.number, reason);
+            }
+            if issue.comments > 0 || tracked.contains_key(&issue.number) {
                 commented.push(issue.number);
             }
         }
         if to_pull.is_empty() {
             info!("no issues to pull");
-            return Ok(commented);
+            return Ok(Pulled { commented, closed });
         }
         let list: Vec<String> = to_pull.iter().map(u64::to_string).collect();
         info!("pulling {} issue(s): {}", to_pull.len(), list.join(" "));
@@ -349,15 +558,56 @@ impl Sync<'_> {
         {
             info!("{line}");
         }
-        Ok(commented)
+        Ok(Pulled { commented, closed })
     }
 
-    async fn import_comments(&self, numbers: &[u64]) -> Result<()> {
-        if numbers.is_empty() {
+    async fn import_close_reasons(&self, closed: &BTreeMap<u64, String>) -> Result<()> {
+        if closed.is_empty() {
             return Ok(());
         }
         let beads = self.bd.export().await?;
         let linked = linked(&beads, self.repo());
+        for (n, state_reason) in closed {
+            let Some(label) = close_reason_for(state_reason) else {
+                continue;
+            };
+            let Some(bead) = linked
+                .get(n)
+                .and_then(|id| beads.iter().find(|b| &b.id == id))
+            else {
+                continue;
+            };
+            let current = bead.close_reason.as_deref().unwrap_or_default();
+            let superseded = bead.dependencies().iter().any(|d| d.kind == "supersedes");
+            if !bead.is_closed()
+                || state_reason_for(current) == state_reason
+                || (superseded && state_reason == "duplicate")
+            {
+                continue;
+            }
+            match self.bd.set_close_reason(&bead.id, label).await {
+                Ok(()) => info!("#{n}: close reason set to '{label}'"),
+                Err(e) => warn!("#{n}: could not set the close reason: {e:#}"),
+            }
+        }
+        Ok(())
+    }
+
+    async fn tracked_comments(&self) -> Result<BTreeMap<u64, Tracked>> {
+        match self.state_get("comments").await? {
+            Some(text) => serde_json::from_str(&text).context("parsing the recorded comments"),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    async fn import_comments(&self, numbers: &[u64]) -> Result<bool> {
+        if numbers.is_empty() {
+            return Ok(false);
+        }
+        let beads = self.bd.export().await?;
+        let linked = linked(&beads, self.repo());
+        let before = self.tracked_comments().await?;
+        let mut all = before.clone();
         for n in numbers {
             let Some(id) = linked.get(n) else { continue };
             let Some(bead) = beads.iter().find(|b| &b.id == id) else {
@@ -382,17 +632,57 @@ impl Sync<'_> {
                 .iter()
                 .map(|c| (c.author.clone().unwrap_or_default(), c.text.clone()))
                 .collect();
-            for (author, text) in missing_comments(&github, &have) {
-                match self.bd.comment_add(id, &author, &text).await {
+            let previous = before.get(n).cloned().unwrap_or_default();
+            let plan = plan_comments(&github, &have, &previous);
+            let mut tracked = plan.tracked.clone();
+            let revert = |cid: u64, tracked: &mut Tracked| match previous.get(&cid) {
+                Some(entry) => tracked.insert(cid, entry.clone()),
+                None => tracked.remove(&cid),
+            };
+            for (cid, author, text) in &plan.add {
+                match self.bd.comment_add(id, author, text).await {
                     Ok(()) => info!("#{n}: imported a comment by {author}"),
-                    Err(e) => warn!("#{n}: could not import a comment by {author}: {e:#}"),
+                    Err(e) => {
+                        warn!("#{n}: could not import a comment by {author}: {e:#}");
+                        revert(*cid, &mut tracked);
+                    }
                 }
             }
+            for (cid, author, text) in &plan.edited {
+                let note = format!("{EDITED_COMMENT} {text}");
+                match self.bd.comment_add(id, author, &note).await {
+                    Ok(()) => info!("#{n}: noted an edit by {author}"),
+                    Err(e) => {
+                        warn!("#{n}: could not note an edit by {author}: {e:#}");
+                        revert(*cid, &mut tracked);
+                    }
+                }
+            }
+            for (cid, author) in &plan.deleted {
+                let note = format!("{DELETED_COMMENT} a comment by {author}");
+                match self.bd.comment_add(id, author, &note).await {
+                    Ok(()) => info!("#{n}: noted a deleted comment by {author}"),
+                    Err(e) => {
+                        warn!("#{n}: could not note a deleted comment by {author}: {e:#}");
+                        tracked.insert(*cid, previous[cid].clone());
+                    }
+                }
+            }
+            if tracked.is_empty() {
+                all.remove(n);
+            } else {
+                all.insert(*n, tracked);
+            }
         }
-        Ok(())
+        if all == before {
+            return Ok(false);
+        }
+        self.state_set("comments", &serde_json::to_string(&all)?)
+            .await?;
+        Ok(true)
     }
 
-    async fn github_relations(&self) -> Result<BTreeSet<String>> {
+    async fn github_relations(&self) -> Result<GithubLinks> {
         let (owner, name) = self
             .repo()
             .split_once('/')
@@ -411,10 +701,49 @@ impl Sync<'_> {
                 .is_some_and(|n| n.eq_ignore_ascii_case(self.repo()))
         };
         let mut edges = BTreeSet::new();
+        let mut mentions = BTreeSet::new();
+        let mut pulls = BTreeMap::new();
+        let mut duplicates = BTreeMap::new();
         for node in &nodes {
             let Some(n) = node["number"].as_u64() else {
                 continue;
             };
+            if let (true, Some(m)) = (
+                own(&node["duplicateOf"]),
+                node["duplicateOf"]["number"].as_u64(),
+            ) {
+                duplicates.insert(n, m);
+            }
+            for pr in node["closedByPullRequestsReferences"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if let Some(url) = pr["url"].as_str() {
+                    pulls.insert(
+                        url.to_string(),
+                        (
+                            n,
+                            pr["author"]["login"]
+                                .as_str()
+                                .unwrap_or("ghost")
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+            for event in node["timelineItems"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let source = &event["source"];
+                if let (true, Some(m)) = (own(source), source["number"].as_u64())
+                    && m != n
+                {
+                    mentions.insert(format!("{} related {}", n.min(m), n.max(m)));
+                }
+            }
             if let (true, Some(p)) = (own(&node["parent"]), node["parent"]["number"].as_u64()) {
                 edges.insert(format!("{n} parent-child {p}"));
             }
@@ -424,12 +753,22 @@ impl Sync<'_> {
                 }
             }
         }
-        Ok(edges)
+        Ok(GithubLinks {
+            relations: edges,
+            mentions,
+            pulls,
+            duplicates,
+        })
     }
 
     async fn sync_relations(&self) -> Result<bool> {
-        let remote = match self.github_relations().await {
-            Ok(remote) => remote,
+        let GithubLinks {
+            relations: remote,
+            mentions,
+            pulls,
+            duplicates,
+        } = match self.github_relations().await {
+            Ok(found) => found,
             Err(e) => {
                 warn!("could not read relations from GitHub; skipping them: {e:#}");
                 return Ok(false);
@@ -481,10 +820,161 @@ impl Sync<'_> {
                 Err(e) => warn!("{}: could not remove: {e:#}", edge_for_log(edge)),
             }
         }
-        if next_base == base {
+        let mut changed = false;
+        if next_base != base {
+            self.state_set("relations", &serde_json::to_string(&next_base)?)
+                .await?;
+            changed = true;
+        }
+        let duplicated = self.import_duplicates(&linked, &duplicates).await?;
+        let mentioned = self.import_mentions(&linked, &mentions).await?;
+        let pulled = self.import_pulls(&linked, &pulls).await?;
+        Ok(changed || duplicated || mentioned || pulled)
+    }
+
+    async fn import_duplicates(
+        &self,
+        linked: &BTreeMap<u64, String>,
+        duplicates: &BTreeMap<u64, u64>,
+    ) -> Result<bool> {
+        let beads = self.bd.export().await?;
+        let mut changed = false;
+        for (n, canonical) in duplicates {
+            let (Some(id), Some(target)) = (linked.get(n), linked.get(canonical)) else {
+                continue;
+            };
+            let superseded = beads.iter().any(|b| {
+                &b.id == id
+                    && b.dependencies()
+                        .iter()
+                        .any(|d| d.kind == "supersedes" && &d.depends_on_id == target)
+            });
+            if superseded {
+                continue;
+            }
+            match self.bd.dep_add(id, target, "supersedes").await {
+                Ok(()) => {
+                    info!("#{n} supersedes link to #{canonical}: added (duplicate on GitHub)");
+                    changed = true;
+                }
+                Err(e) => warn!("#{n}: could not link the duplicate of #{canonical}: {e:#}"),
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn import_pulls(
+        &self,
+        linked: &BTreeMap<u64, String>,
+        pulls: &BTreeMap<String, (u64, String)>,
+    ) -> Result<bool> {
+        let seen: BTreeSet<String> = match self.state_get("pulls").await? {
+            Some(text) => serde_json::from_str(&text).context("parsing the recorded pulls")?,
+            None => BTreeSet::new(),
+        };
+        let next: BTreeSet<String> = pulls
+            .iter()
+            .filter(|(_, (n, _))| linked.contains_key(n))
+            .map(|(url, _)| url.clone())
+            .collect();
+        let mut recorded = next.clone();
+        let beads = self.bd.export().await?;
+        for url in next.difference(&seen) {
+            let (n, author) = &pulls[url];
+            let id = &linked[n];
+            let Some(bead) = beads.iter().find(|b| &b.id == id) else {
+                continue;
+            };
+            if bead.is_closed() {
+                continue;
+            }
+            if bead.status.as_str() == Some("open") {
+                match self.bd.set_status(id, "in_progress").await {
+                    Ok(()) => info!("#{n}: in progress, pull request {url} is open"),
+                    Err(e) => {
+                        warn!("#{n}: could not set the status; will retry next run: {e:#}");
+                        recorded.remove(url);
+                        continue;
+                    }
+                }
+            }
+            let text = format!("{LINKED_PR_COMMENT} {url}");
+            if bead
+                .comments()
+                .iter()
+                .any(|c| c.text.contains(url.as_str()))
+            {
+                continue;
+            }
+            if let Err(e) = self.bd.comment_add(id, author, &text).await {
+                warn!("#{n}: could not record the pull request; will retry next run: {e:#}");
+                recorded.remove(url);
+            }
+        }
+        if recorded == seen {
             return Ok(false);
         }
-        self.state_set("relations", &serde_json::to_string(&next_base)?)
+        self.state_set("pulls", &serde_json::to_string(&recorded)?)
+            .await?;
+        Ok(true)
+    }
+
+    async fn import_mentions(
+        &self,
+        linked: &BTreeMap<u64, String>,
+        mentions: &BTreeSet<String>,
+    ) -> Result<bool> {
+        let beads = self.bd.export().await?;
+        let imported: BTreeSet<String> = match self.state_get("mentions").await? {
+            Some(text) => serde_json::from_str(&text).context("parsing the recorded mentions")?,
+            None => BTreeSet::new(),
+        };
+        let number_of: BTreeMap<&str, u64> =
+            linked.iter().map(|(n, id)| (id.as_str(), *n)).collect();
+        let have: BTreeSet<String> = beads
+            .iter()
+            .flat_map(Bead::dependencies)
+            .filter_map(|d| {
+                let (a, b) = (
+                    *number_of.get(d.issue_id.as_str())?,
+                    *number_of.get(d.depends_on_id.as_str())?,
+                );
+                Some(format!("{} related {}", a.min(b), a.max(b)))
+            })
+            .collect();
+        let both_linked = |edge: &str| {
+            let parts: Vec<&str> = edge.split(' ').collect();
+            parts.len() == 3
+                && [parts[0], parts[2]]
+                    .iter()
+                    .all(|n| n.parse().is_ok_and(|n: u64| linked.contains_key(&n)))
+        };
+        let next: BTreeSet<String> = mentions
+            .iter()
+            .filter(|e| both_linked(e))
+            .cloned()
+            .collect();
+        let mut recorded = next.clone();
+        for edge in next.difference(&imported).filter(|e| !have.contains(*e)) {
+            let parts: Vec<&str> = edge.split(' ').collect();
+            let id = |n: &str| linked[&n.parse::<u64>().unwrap()].clone();
+            let shown = edge_for_log(edge);
+            match self
+                .bd
+                .dep_add(&id(parts[0]), &id(parts[2]), "related")
+                .await
+            {
+                Ok(()) => info!("{shown}: imported from a cross-reference"),
+                Err(e) => {
+                    warn!("{shown}: could not add; will retry next run: {e:#}");
+                    recorded.remove(edge);
+                }
+            }
+        }
+        if recorded == imported {
+            return Ok(false);
+        }
+        self.state_set("mentions", &serde_json::to_string(&recorded)?)
             .await?;
         Ok(true)
     }
@@ -502,10 +992,12 @@ impl Sync<'_> {
                 }
             }
         }
-        let commented = self.pull_issues(since.as_deref()).await?;
-        self.import_comments(&commented).await?;
+        let pulled = self.pull_issues(since.as_deref()).await?;
+        self.import_close_reasons(&pulled.closed).await?;
+        let comments_changed = self.import_comments(&pulled.commented).await?;
         let relations_changed = self.sync_relations().await?;
-        let changed = relations_changed || self.bd.export_raw().await? != before;
+        let changed =
+            relations_changed || comments_changed || self.bd.export_raw().await? != before;
         if changed && !matches!(self.mode, Mode::Issues(_)) {
             self.state_set("since", &self.next_since).await?;
         }
@@ -613,79 +1105,4 @@ impl Sync<'_> {
 fn edge_for_log(edge: &str) -> String {
     let parts: Vec<&str> = edge.split(' ').collect();
     format!("#{} {} #{}", parts[0], parts[1], parts[2])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn issue_numbers_from_refs() {
-        let repo = "Acme/Widgets";
-        assert_eq!(
-            issue_number("https://github.com/acme/widgets/issues/12", repo),
-            Some(12)
-        );
-        assert_eq!(issue_number("gh-7", repo), Some(7));
-        assert_eq!(issue_number("github:8", repo), Some(8));
-        assert_eq!(
-            issue_number("https://github.com/acme/other/issues/12", repo),
-            None
-        );
-        assert_eq!(
-            issue_number("https://github.com/acme/widgets/pull/12", repo),
-            None
-        );
-        assert_eq!(issue_number("jira-1", repo), None);
-    }
-
-    #[test]
-    fn issue_info() {
-        let issue = json!({"number": 3, "comments": 2, "labels": [{"name": "type::bug"}, "priority::high"]});
-        assert_eq!(
-            IssueInfo::from_json(&issue),
-            Some(IssueInfo {
-                number: 3,
-                is_pr: false,
-                bd_created: true,
-                comments: 2
-            })
-        );
-        let pr = json!({"number": 4, "pull_request": {}, "labels": []});
-        assert!(IssueInfo::from_json(&pr).unwrap().is_pr);
-    }
-
-    #[test]
-    fn comments_match_by_author_and_text() {
-        let github = vec![
-            json!({"user": {"login": "octo"}, "body": "looks good\r\n"}),
-            json!({"user": {"login": "octo"}, "body": "+1"}),
-            json!({"user": {"login": "octo"}, "body": "+1"}),
-            json!({"user": {"login": "me"}, "body": "from beads\n\n<!-- bd-comment:abc -->"}),
-        ];
-        let bead = vec![
-            ("octo".to_string(), "looks good".to_string()),
-            ("octo".to_string(), "+1".to_string()),
-        ];
-        assert_eq!(
-            missing_comments(&github, &bead),
-            vec![("octo".to_string(), "+1".to_string())]
-        );
-    }
-
-    fn set(edges: &[&str]) -> BTreeSet<String> {
-        edges.iter().map(|e| e.to_string()).collect()
-    }
-
-    #[test]
-    fn relations_merge_three_ways() {
-        let linked: BTreeMap<u64, String> = (1..=5).map(|n| (n, format!("b-{n}"))).collect();
-        let remote = set(&["2 parent-child 1", "3 blocks 1", "4 blocks 9"]);
-        let base = set(&["3 blocks 1", "5 blocks 1"]);
-        let have = set(&["3 blocks 1", "5 blocks 1", "4 blocks 2"]);
-        let plan = plan_relations(&remote, &base, &have, &linked);
-        assert_eq!(plan.add, ["2 parent-child 1"]);
-        assert_eq!(plan.remove, ["5 blocks 1"]);
-        assert_eq!(plan.base, set(&["2 parent-child 1", "3 blocks 1"]));
-    }
 }

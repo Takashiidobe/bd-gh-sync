@@ -1,0 +1,11 @@
+# Caddy terminates HTTPS (certificates are automatic) and forwards only the
+# webhook and health endpoints to bd-gh-sync on localhost.
+sync.example.com {
+	@sync path /webhook /healthz
+	handle @sync {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle {
+		respond 404
+	}
+}

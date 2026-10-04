@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::{
     bd::{Bd, Bead, Workdir},
     github::{DEFAULT_API_URL, GitHub, Response},
-    sync::{COMMENT_MARKER, normalize},
+    sync::{COMMENT_MARKER, is_sync_note, normalize, state_reason_for},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -80,6 +80,7 @@ pub fn issue_path(external_ref: &str) -> Option<String> {
 fn links(beads: &[Bead]) -> BTreeMap<String, String> {
     beads
         .iter()
+        .filter(|b| !b.detached())
         .filter_map(|b| Some((b.id.clone(), issue_path(b.external_ref.as_deref()?)?)))
         .collect()
 }
@@ -251,9 +252,16 @@ impl Watcher {
             }
         }
         let assignees = self.step("assignees", self.push_assignees(&beads).await);
+        let deleted = self.step("deleted beads", self.push_deleted(&beads).await);
+        let close_reasons = self.step("close reasons", self.push_close_reasons(&beads).await);
         let comments = self.step("comments", self.push_comments(&beads).await);
         let relations = self.step("relations", self.push_relations(&beads).await);
-        fields.merge(assignees).merge(comments).merge(relations)
+        fields
+            .merge(assignees)
+            .merge(deleted)
+            .merge(close_reasons)
+            .merge(comments)
+            .merge(relations)
     }
 
     fn step(&self, name: &str, result: Result<Outcome>) -> Outcome {
@@ -272,6 +280,7 @@ impl Watcher {
     async fn push_fields(&self, beads: &[Bead]) -> Result<Outcome> {
         let current: BTreeMap<String, String> = beads
             .iter()
+            .filter(|b| !b.detached())
             .map(|b| (b.id.clone(), fingerprint(b)))
             .collect();
         let previous: BTreeMap<String, String> = match self.load("pushed.json") {
@@ -422,6 +431,231 @@ impl Watcher {
         Ok(outcome)
     }
 
+    async fn push_deleted(&self, beads: &[Bead]) -> Result<Outcome> {
+        let file = "links.json";
+        let current = links(beads);
+        let mut previous: BTreeMap<String, String> = match self.load(file) {
+            Some(previous) => previous,
+            None => {
+                self.save(file, &current)?;
+                return Ok(Outcome::Nothing);
+            }
+        };
+        if beads.is_empty() && !previous.is_empty() {
+            warn!("bd exported no beads; not treating them as deleted");
+            return Ok(Outcome::Failed);
+        }
+        let gone: Vec<(String, String)> = previous
+            .iter()
+            .filter(|(id, _)| !beads.iter().any(|b| &b.id == *id))
+            .map(|(id, path)| (id.clone(), path.clone()))
+            .collect();
+
+        let mut outcome = Outcome::Nothing;
+        for (id, path) in gone {
+            if self.opts.dry_run {
+                info!("would close the issue of deleted bead {id}");
+                outcome.pushed();
+                continue;
+            }
+            match self.bd().exists(&id).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    previous.remove(&id);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("{id}: could not confirm the bead is deleted; will retry: {e:#}");
+                    outcome = Outcome::Failed;
+                    continue;
+                }
+            }
+            let issue = self.call(Method::GET, &path, None).await;
+            if matches!(issue.status, 404 | 410) || (issue.ok() && issue.body["state"] == "closed")
+            {
+                previous.remove(&id);
+                continue;
+            }
+            if !issue.ok() {
+                warn!(
+                    "{id}: could not read {path} (HTTP {}); will retry",
+                    issue.status
+                );
+                outcome = Outcome::Failed;
+                continue;
+            }
+            let resp = self
+                .call(
+                    Method::PATCH,
+                    &path,
+                    Some(&json!({"state": "closed", "state_reason": "not_planned"})),
+                )
+                .await;
+            if resp.ok() {
+                info!("{id} was deleted: closed {path} on GitHub as not planned");
+                outcome.pushed();
+                previous.remove(&id);
+            } else if resp.permanent_failure() {
+                warn!(
+                    "{id}: GitHub refused to close {path} (HTTP {}); not retrying",
+                    resp.status
+                );
+                previous.remove(&id);
+            } else {
+                warn!(
+                    "{id}: could not close {path} (HTTP {}); will retry",
+                    resp.status
+                );
+                outcome = Outcome::Failed;
+            }
+        }
+        for (id, path) in current {
+            previous.insert(id, path);
+        }
+        self.save(file, &previous)?;
+        Ok(outcome)
+    }
+
+    async fn push_close_reasons(&self, beads: &[Bead]) -> Result<Outcome> {
+        let file = "close-reasons.json";
+        let links = links(beads);
+        let mut current: BTreeMap<String, String> = beads
+            .iter()
+            .filter(|b| b.is_closed())
+            .map(|b| {
+                let superseder = b
+                    .dependencies()
+                    .iter()
+                    .find(|d| d.kind == "supersedes" && d.issue_id == b.id)
+                    .filter(|d| links.contains_key(&d.depends_on_id));
+                let want = match superseder {
+                    Some(d) => format!("duplicate:{}", d.depends_on_id),
+                    None => {
+                        state_reason_for(b.close_reason.as_deref().unwrap_or_default()).to_string()
+                    }
+                };
+                (b.id.clone(), want)
+            })
+            .collect();
+        let previous: BTreeMap<String, String> = match self.load(file) {
+            Some(previous) => previous,
+            None if self.opts.initial_push => BTreeMap::new(),
+            None => {
+                self.save(file, &current)?;
+                return Ok(Outcome::Nothing);
+            }
+        };
+        let todo: Vec<(String, String, String)> = current
+            .iter()
+            .filter(|(id, want)| previous.get(*id) != Some(want))
+            .filter_map(|(id, want)| Some((id.clone(), links.get(id)?.clone(), want.clone())))
+            .collect();
+
+        let mut outcome = Outcome::Nothing;
+        for (id, path, want) in todo {
+            let revert = |current: &mut BTreeMap<String, String>| match previous.get(&id) {
+                Some(v) => current.insert(id.clone(), v.clone()),
+                None => current.remove(&id),
+            };
+            if self.opts.dry_run {
+                info!("would close {id} on GitHub as {want}");
+                outcome.pushed();
+                continue;
+            }
+            let issue = self.call(Method::GET, &path, None).await;
+            if !issue.ok() {
+                warn!(
+                    "{id}: could not read {path} (HTTP {}); will retry",
+                    issue.status
+                );
+                revert(&mut current);
+                outcome = Outcome::Failed;
+                continue;
+            }
+            if issue.body["state"] != "closed" {
+                revert(&mut current);
+                continue;
+            }
+            if let Some((_, target)) = want.split_once(':') {
+                match self
+                    .mark_duplicate(&issue.body, &links[target], target, &id)
+                    .await
+                {
+                    Ok(true) => outcome.pushed(),
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!("{id}: could not mark as a duplicate of {target}: {e:#}; will retry");
+                        revert(&mut current);
+                        outcome = Outcome::Failed;
+                    }
+                }
+                continue;
+            }
+            if issue.body["state_reason"].as_str().unwrap_or("completed") == want {
+                continue;
+            }
+            let resp = self
+                .call(
+                    Method::PATCH,
+                    &path,
+                    Some(&json!({"state": "closed", "state_reason": want})),
+                )
+                .await;
+            if resp.ok() {
+                info!("{id}: closed on GitHub as {want}");
+                outcome.pushed();
+            } else if resp.permanent_failure() {
+                warn!(
+                    "{id}: GitHub refused the close reason '{want}' (HTTP {}); not retrying",
+                    resp.status
+                );
+            } else {
+                warn!(
+                    "{id}: could not set the close reason (HTTP {}); will retry",
+                    resp.status
+                );
+                revert(&mut current);
+                outcome = Outcome::Failed;
+            }
+        }
+        self.save(file, &current)?;
+        Ok(outcome)
+    }
+
+    async fn mark_duplicate(
+        &self,
+        issue: &Value,
+        target_path: &str,
+        target: &str,
+        id: &str,
+    ) -> Result<bool> {
+        let canonical = self.gh.get(target_path).await?;
+        let (Some(issue_node), Some(canonical_node)) =
+            (issue["node_id"].as_str(), canonical["node_id"].as_str())
+        else {
+            bail!("GitHub returned no node ids");
+        };
+        let current = self
+            .gh
+            .graphql(
+                "query($id: ID!) { node(id: $id) { ... on Issue { stateReason duplicateOf { id } } } }",
+                json!({"id": issue_node}),
+            )
+            .await?;
+        let node = &current["node"];
+        if node["stateReason"] == "DUPLICATE" && node["duplicateOf"]["id"] == canonical_node {
+            return Ok(false);
+        }
+        self.gh
+            .graphql(
+                "mutation($issue: ID!, $canonical: ID!) { closeIssue(input: {issueId: $issue, stateReason: DUPLICATE, duplicateIssueId: $canonical}) { issue { number } } }",
+                json!({"issue": issue_node, "canonical": canonical_node}),
+            )
+            .await?;
+        info!("{id}: closed on GitHub as a duplicate of {target}");
+        Ok(true)
+    }
+
     async fn push_comments(&self, beads: &[Bead]) -> Result<Outcome> {
         let file = "comments.json";
         let links = links(beads);
@@ -472,7 +706,7 @@ impl Watcher {
             let on_github = existing.iter().any(|c| {
                 let body = c["body"].as_str().unwrap_or("");
                 body.contains(&marker) || normalize(body) == normalize(text)
-            });
+            }) || is_sync_note(text);
             if !on_github {
                 let body = json!({"body": format!("{text}\n\n{marker}")});
                 let resp = self
@@ -737,57 +971,5 @@ async fn drain(rx: &mut mpsc::UnboundedReceiver<()>, quiet: Duration) {
     while let Ok(Some(())) =
         tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + quiet), rx.recv()).await
     {
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn issue_paths() {
-        assert_eq!(
-            issue_path("https://github.com/acme/widgets/issues/12").as_deref(),
-            Some("repos/acme/widgets/issues/12")
-        );
-        assert_eq!(
-            issue_path("http://127.0.0.1:9/acme/widgets/issues/3").as_deref(),
-            Some("repos/acme/widgets/issues/3")
-        );
-        for bad in [
-            "gh-12",
-            "https://github.com/acme/widgets/pull/1",
-            "https://github.com/acme/widgets/issues/1x",
-        ] {
-            assert_eq!(issue_path(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn fingerprints_match_the_shell_watcher() {
-        let bead: Bead = serde_json::from_str(
-            r#"{"id":"a-1","title":"t","status":"open","priority":2,"issue_type":"task","labels":["b","a"]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            fingerprint(&bead),
-            r#"{"title":"t","description":"","status":"open","priority":2,"issue_type":"task","labels":["a","b"]}"#
-        );
-    }
-
-    #[test]
-    fn ignores_non_bead_files() {
-        assert!(ignored(Path::new("/r/.beads/issues.jsonl")));
-        assert!(ignored(Path::new("/r/.beads/daemon.lock")));
-        assert!(ignored(Path::new("/r/.beads/last-touched")));
-        assert!(ignored(Path::new("/r/.beads/bd.sock")));
-        assert!(!ignored(Path::new("/r/.beads/dolt/noms/manifest")));
-    }
-
-    #[test]
-    fn outcomes_merge() {
-        assert_eq!(Outcome::Nothing.merge(Outcome::Pushed), Outcome::Pushed);
-        assert_eq!(Outcome::Pushed.merge(Outcome::Failed), Outcome::Failed);
-        assert_eq!(Outcome::Nothing.merge(Outcome::Nothing), Outcome::Nothing);
     }
 }

@@ -81,6 +81,7 @@ pub struct Bead {
     pub title: Value,
     pub description: Option<String>,
     pub status: Value,
+    pub close_reason: Option<String>,
     pub priority: Value,
     pub issue_type: Value,
     pub labels: Option<Vec<String>>,
@@ -107,11 +108,29 @@ pub struct Dependency {
     pub kind: String,
 }
 
+pub const DELETED_LABEL: &str = "github-deleted";
+pub const MOVED_LABEL: &str = "github-transferred";
+
 pub const RELATION_TYPES: &[&str] = &["blocks", "parent-child"];
 
 impl Bead {
     pub fn comments(&self) -> &[Comment] {
         self.comments.as_deref().unwrap_or_default()
+    }
+
+    pub fn detached(&self) -> bool {
+        self.labels
+            .iter()
+            .flatten()
+            .any(|l| l == DELETED_LABEL || l == MOVED_LABEL)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.status.as_str() == Some("closed")
+    }
+
+    pub fn dependencies(&self) -> &[Dependency] {
+        self.dependencies.as_deref().unwrap_or_default()
     }
 
     pub fn relations(&self) -> impl Iterator<Item = &Dependency> {
@@ -256,6 +275,38 @@ impl<'a> Bd<'a> {
         result.map(drop)
     }
 
+    pub async fn set_close_reason(&self, id: &str, reason: &str) -> Result<()> {
+        self.run(&["reopen", id]).await?;
+        self.run(&["close", id, "--force", "-r", reason])
+            .await
+            .map(drop)
+    }
+
+    pub async fn set_status(&self, id: &str, status: &str) -> Result<()> {
+        self.run(&["update", id, "-s", status]).await.map(drop)
+    }
+
+    pub async fn label_add(&self, id: &str, label: &str) -> Result<()> {
+        self.run(&["label", "add", id, label]).await.map(drop)
+    }
+
+    pub async fn set_external_ref(&self, id: &str, external_ref: &str) -> Result<()> {
+        self.run(&["update", id, "--external-ref", external_ref])
+            .await
+            .map(drop)
+    }
+
+    pub async fn exists(&self, id: &str) -> Result<bool> {
+        let out = self.output(&["show", id, "--json"]).await?;
+        if out.success {
+            return Ok(true);
+        }
+        if out.combined().to_lowercase().contains("not found") {
+            return Ok(false);
+        }
+        bail!("bd show {id} failed:\n{}", out.combined())
+    }
+
     pub async fn dep_add(&self, from: &str, to: &str, kind: &str) -> Result<()> {
         self.run(&["dep", "add", from, to, "-t", kind])
             .await
@@ -273,21 +324,4 @@ fn json_field(text: &str, key: &str) -> Option<String> {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn export_keeps_issues_only() {
-        let text = r#"{"_type":"issue","id":"a-1","title":"x","dependencies":[{"issue_id":"a-1","depends_on_id":"a-2","type":"blocks"},{"issue_id":"a-1","depends_on_id":"a-3","type":"related"}]}
-{"_type":"memory","id":"m"}
-{"id":"a-2","title":"y","comments":[{"id":"c","author":"me","text":"hi"}]}
-"#;
-        let beads = parse_export(text).unwrap();
-        assert_eq!(beads.len(), 2);
-        assert_eq!(beads[0].relations().count(), 1);
-        assert_eq!(beads[1].comments()[0].text, "hi");
-    }
 }
