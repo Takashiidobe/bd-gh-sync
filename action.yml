@@ -23,7 +23,7 @@ inputs:
     required: false
     default: ${{ github.token }}
   bd-version:
-    description: beads version to install from npm (@beads/bd).
+    description: beads release to install (downloaded from github.com/gastownhall/beads releases).
     required: false
     default: "1.3.1"
   transport:
@@ -58,10 +58,11 @@ runs:
       env:
         BD_VERSION: ${{ inputs.bd-version }}
       run: |
-        if ! command -v bd >/dev/null || ! bd version | grep -q "$BD_VERSION"; then
-          npm install --global --silent "@beads/bd@$BD_VERSION"
+        if command -v bd >/dev/null && bd version | grep -q "version $BD_VERSION "; then
+          bd version
+        else
+          "$GITHUB_ACTION_PATH/scripts/install-bd.sh" "$BD_VERSION" "$RUNNER_TEMP/beads-bin"
         fi
-        bd version
 
     - name: Pick issues to sync
       id: pick
