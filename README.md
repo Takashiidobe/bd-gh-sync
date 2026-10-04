@@ -55,7 +55,7 @@ Action inputs:
 | `issues` | the event's issue, or `all` on schedule/dispatch | issue numbers to pull, or `all` |
 | `token` | `github.token` | token for reading issues and publishing |
 | `transport` | `auto` | `dolt`, `jsonl` or `auto` (see above) |
-| `bd-version` | `1.3.1` | beads version installed from npm (`@beads/bd`) |
+| `bd-version` | `1.3.1` | beads release to install (from the GitHub release) |
 | `jsonl-path` | `.beads/issues.jsonl` | export path for the JSONL transport |
 | `adopt-bd-created` | `false` | also import bd-created issues whose bead isn't published (see loop guards) |
 | `commit-message` | `beads: sync from GitHub` | JSONL commit message |
