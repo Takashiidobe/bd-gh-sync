@@ -1,0 +1,108 @@
+name: beads GitHub sync
+description: >-
+  Pull GitHub issue changes into the repository's beads (bd) issue database
+  as they happen, using beads' native `bd github pull`, and publish the
+  result through beads' Dolt remote or the .beads/issues.jsonl export.
+branding:
+  icon: refresh-cw
+  color: purple
+
+inputs:
+  issues:
+    description: >-
+      Space-separated issue numbers to pull, or "all" to reconcile every issue.
+      Defaults to the issue from the triggering `issues` / `issue_comment`
+      event, or "all" for `schedule` and `workflow_dispatch`.
+    required: false
+    default: ""
+  token:
+    description: >-
+      Token used to read issues and push the export commit. The default
+      GITHUB_TOKEN is recommended: pushes made with it never trigger other
+      workflows, which keeps the sync from looping.
+    required: false
+    default: ${{ github.token }}
+  bd-version:
+    description: beads version to install from npm (@beads/bd).
+    required: false
+    default: "1.3.1"
+  transport:
+    description: >-
+      How the beads database travels with the repository. "dolt" uses beads'
+      git-backed Dolt remote (refs/dolt/data, what `bd init` sets up in a git
+      repo); "jsonl" commits the .beads/issues.jsonl export. "auto" picks dolt
+      when origin has refs/dolt/data, else jsonl.
+    required: false
+    default: auto
+  jsonl-path:
+    description: Path of the git-tracked beads export (jsonl transport).
+    required: false
+    default: .beads/issues.jsonl
+  adopt-bd-created:
+    description: >-
+      Also import issues that a `bd github push` created but whose bead is not
+      in the export yet. Leave false unless you know that bead is gone, or the
+      same GitHub issue ends up with two beads.
+    required: false
+    default: "false"
+  commit-message:
+    description: Message for the export commit (jsonl transport).
+    required: false
+    default: "beads: sync from GitHub"
+
+runs:
+  using: composite
+  steps:
+    - name: Install beads
+      shell: bash
+      env:
+        BD_VERSION: ${{ inputs.bd-version }}
+      run: |
+        if ! command -v bd >/dev/null || ! bd version | grep -q "$BD_VERSION"; then
+          npm install --global --silent "@beads/bd@$BD_VERSION"
+        fi
+        bd version
+
+    - name: Pick issues to sync
+      id: pick
+      shell: bash
+      env:
+        INPUT_ISSUES: ${{ inputs.issues }}
+        EVENT_NAME: ${{ github.event_name }}
+        EVENT_ISSUE: ${{ github.event.issue.number }}
+      run: |
+        issues=$INPUT_ISSUES
+        if [ -z "$issues" ]; then
+          case $EVENT_NAME in
+            issues|issue_comment) issues=$EVENT_ISSUE ;;
+            schedule|workflow_dispatch) issues=all ;;
+          esac
+        fi
+        echo "issues=$issues" >>"$GITHUB_OUTPUT"
+        echo "Syncing: ${issues:-nothing}"
+
+    - name: Sync GitHub issues into beads
+      if: steps.pick.outputs.issues != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        BEADS_TRANSPORT: ${{ inputs.transport }}
+        BEADS_JSONL: ${{ inputs.jsonl-path }}
+        ADOPT_BD_CREATED: ${{ inputs.adopt-bd-created }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        ISSUES: ${{ steps.pick.outputs.issues }}
+      run: |
+        # Dolt's git remote runs its own git processes that do not see the
+        # checkout's auth header; let them authenticate with the same token.
+        # The helper reads the token from the environment at call time.
+        git config --global credential.https://github.com.helper \
+          '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        if [ "$ISSUES" = all ]; then
+          "$GITHUB_ACTION_PATH/scripts/gh-to-beads.sh" --publish --all
+        else
+          # shellcheck disable=SC2086
+          "$GITHUB_ACTION_PATH/scripts/gh-to-beads.sh" --publish $ISSUES
+        fi
