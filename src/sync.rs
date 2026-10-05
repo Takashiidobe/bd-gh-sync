@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use crate::{
     bd::{Bd, Bead, DELETED_LABEL, MOVED_LABEL, Workdir},
     github::GitHub,
+    ids::{self, IdConfig},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +46,7 @@ pub const LINKED_PR_COMMENT: &str = "Linked pull request:";
 const EDITED_COMMENT: &str = "Edited on GitHub:";
 const DELETED_COMMENT: &str = "Deleted on GitHub:";
 const CLOSE_COMMENT_WINDOW: Duration = Duration::from_secs(10);
+const FRESH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub fn is_sync_note(text: &str) -> bool {
     [LINKED_PR_COMMENT, EDITED_COMMENT, DELETED_COMMENT]
@@ -1074,6 +1076,144 @@ impl Sync<'_> {
         Ok(true)
     }
 
+    async fn id_config(&self) -> IdConfig {
+        let mut config = IdConfig::default();
+        let read = |key: &'static str| async move { self.bd.config_get(key).await.ok().flatten() };
+        if let Some(n) = read("min_hash_length").await.and_then(|v| v.parse().ok()) {
+            config.min_len = n;
+        }
+        if let Some(n) = read("max_hash_length").await.and_then(|v| v.parse().ok()) {
+            config.max_len = n;
+        }
+        if let Some(p) = read("max_collision_prob")
+            .await
+            .and_then(|v| v.parse().ok())
+        {
+            config.max_collision = p;
+        }
+        config
+    }
+
+    async fn fresh_beads(&self) -> Result<BTreeMap<String, u64>> {
+        match self.state_get("fresh").await? {
+            Some(text) => serde_json::from_str(&text).context("parsing the recorded new beads"),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    async fn shorten_imports(&self) -> Result<()> {
+        let beads = self.bd.export().await?;
+        let mut taken: BTreeSet<String> = beads.iter().map(|b| b.id.clone()).collect();
+        let mut config = None;
+        let mut fresh = self.fresh_beads().await?;
+        let mut renamed = false;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        for bead in &beads {
+            let Some(prefix) = ids::imported_prefix(&bead.id) else {
+                continue;
+            };
+            let Some(number) = bead
+                .external_ref
+                .as_deref()
+                .and_then(|r| issue_number(r, self.repo()))
+            else {
+                continue;
+            };
+            let config = match config {
+                Some(config) => config,
+                None => *config.insert(self.id_config().await),
+            };
+            let len = ids::adaptive_len(taken.len() + 1, &config);
+            let key = format!("{}#{number}", self.repo().to_lowercase());
+            let id = ids::short_id(prefix, &key, len, &config, &taken);
+            match self.bd.rename(&bead.id, &id).await {
+                Ok(()) => {
+                    info!("#{number}: renamed {} to {id}", bead.id);
+                    taken.remove(&bead.id);
+                    taken.insert(id.clone());
+                    fresh.insert(id, now);
+                    renamed = true;
+                }
+                Err(e) => warn!("#{number}: could not rename {}: {e:#}", bead.id),
+            }
+        }
+        if renamed {
+            self.state_set("fresh", &serde_json::to_string(&fresh)?)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn nest_fresh(&self) -> Result<()> {
+        let mut fresh = self.fresh_beads().await?;
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let before = fresh.clone();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        fresh.retain(|_, at| now.saturating_sub(*at) < FRESH_TTL.as_secs());
+        loop {
+            let beads = self.bd.export().await?;
+            let mut taken: BTreeSet<String> = beads.iter().map(|b| b.id.clone()).collect();
+            fresh.retain(|id, _| taken.contains(id));
+            let parent_of = |id: &str| -> Option<String> {
+                beads
+                    .iter()
+                    .find(|b| b.id == id)?
+                    .dependencies()
+                    .iter()
+                    .find(|d| d.kind == "parent-child" && d.issue_id == id)
+                    .map(|d| d.depends_on_id.clone())
+            };
+            let nested = |id: &str, parent: &str| id.starts_with(&format!("{parent}."));
+            let next = fresh.keys().find_map(|id| {
+                let parent = parent_of(id)?;
+                let waiting = fresh.contains_key(&parent)
+                    && parent_of(&parent).is_some_and(|grand| !nested(&parent, &grand));
+                (!nested(id, &parent) && !waiting).then(|| (id.clone(), parent))
+            });
+            let Some((id, parent)) = next else {
+                break;
+            };
+            let new = ids::next_child(&parent, &taken);
+            let mut moves = vec![(id.clone(), new.clone())];
+            taken.insert(new.clone());
+            for below in ids::descendants(&id, &taken) {
+                let renamed = format!("{new}{}", &below[id.len()..]);
+                moves.push((below, renamed));
+            }
+            let mut failed = false;
+            for (from, to) in &moves {
+                match self.bd.rename(from, to).await {
+                    Ok(()) => info!("renamed {from} to {to} under {parent}"),
+                    Err(e) => {
+                        warn!("could not rename {from} to {to}: {e:#}");
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            fresh.remove(&id);
+            if failed {
+                break;
+            }
+            for (from, to) in moves.iter().skip(1) {
+                if let Some(at) = fresh.remove(from) {
+                    fresh.insert(to.clone(), at);
+                }
+            }
+        }
+        if fresh != before {
+            self.state_set("fresh", &serde_json::to_string(&fresh)?)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn sync_github(&mut self) -> Result<bool> {
         let before = self.bd.export_raw().await?;
         let mut since = None;
@@ -1088,12 +1228,18 @@ impl Sync<'_> {
             }
         }
         let pulled = self.pull_issues(since.as_deref()).await?;
+        if let Err(e) = self.shorten_imports().await {
+            warn!("could not shorten imported bead ids: {e:#}");
+        }
         let (comments_changed, from_comment) = self
             .import_comments(&pulled.commented, &pulled.closing)
             .await?;
         self.import_close_reasons(&pulled.closed, &from_comment)
             .await?;
         let relations_changed = self.sync_relations().await?;
+        if let Err(e) = self.nest_fresh().await {
+            warn!("could not nest new beads under their parents: {e:#}");
+        }
         let changed =
             relations_changed || comments_changed || self.bd.export_raw().await? != before;
         if changed && !matches!(self.mode, Mode::Issues(_)) {

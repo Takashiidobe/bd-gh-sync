@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::{
     bd::{Bd, Bead, Workdir},
     github::{DEFAULT_API_URL, GitHub, Response},
+    ids,
     sync::{COMMENT_MARKER, is_sync_note, normalize, state_reason_for},
 };
 
@@ -244,6 +245,7 @@ impl Watcher {
         let Some(mut beads) = self.export().await else {
             return Outcome::Failed;
         };
+        self.migrate_renames(&beads);
         let fields = self.step("fields", self.push_fields(&beads).await);
         if fields == Outcome::Pushed && !self.opts.dry_run {
             match self.export().await {
@@ -274,6 +276,55 @@ impl Watcher {
     async fn run_pass(&self) {
         if self.sync_pass().await == Outcome::Pushed && !self.opts.dry_run {
             self.sync_pass().await;
+        }
+    }
+
+    fn migrate_renames(&self, beads: &[Bead]) {
+        let Some(previous) = self.load::<BTreeMap<String, String>>("links.json") else {
+            return;
+        };
+        let current = links(beads);
+        let by_path: BTreeMap<&str, &str> = current
+            .iter()
+            .map(|(id, path)| (path.as_str(), id.as_str()))
+            .collect();
+        let renames: BTreeMap<String, String> = previous
+            .iter()
+            .filter(|(id, _)| !beads.iter().any(|b| &b.id == *id))
+            .filter_map(|(id, path)| {
+                let new = by_path.get(path.as_str())?;
+                (!previous.contains_key(*new)).then(|| (id.clone(), new.to_string()))
+            })
+            .collect();
+        if renames.is_empty() {
+            return;
+        }
+        for (old, new) in &renames {
+            info!("{old} was renamed to {new}; keeping its sync state");
+        }
+        if self.opts.dry_run {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.state_dir) else {
+            return;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(mut value) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            else {
+                continue;
+            };
+            ids::rename_ids(&mut value, &renames);
+            let written = serde_json::to_string(&value)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| Ok(std::fs::write(&path, text + "\n")?));
+            if let Err(e) = written {
+                warn!("could not migrate {}: {e:#}", path.display());
+            }
         }
     }
 

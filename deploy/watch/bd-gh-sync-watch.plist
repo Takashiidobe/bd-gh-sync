@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>bd-gh-sync.@NAME@</string>
+	<key>WorkingDirectory</key>
+	<string>@REPO@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@HOME@/.local/bin/bd-gh-sync</string>
+		<string>watch</string>
+		<string>--dolt-sync</string>
+		<string>30</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>@HOME@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/bd-gh-sync.@NAME@.log</string>
+</dict>
+</plist>
