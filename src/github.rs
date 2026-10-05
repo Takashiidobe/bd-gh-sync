@@ -378,3 +378,60 @@ pub async fn register_webhook(
     }
     Ok(outcome)
 }
+
+pub async fn preflight(gh: &GitHub, repo: &str, webhook: bool) -> Result<()> {
+    let info = gh.send(Method::GET, &format!("repos/{repo}"), None).await?;
+    if info.status == 404 {
+        bail!("{repo}: not found, or the token has not been granted this repository");
+    }
+    if !info.ok() {
+        bail!("{repo}: HTTP {}: {}", info.status, message(&info.body));
+    }
+    if info.body["has_issues"].as_bool() == Some(false) {
+        bail!("{repo}: issues are disabled on this repository");
+    }
+    if info.body["permissions"]["push"].as_bool() == Some(false) {
+        bail!(
+            "{repo}: the token is read-only here; the server pushes refs/dolt/data and writes \
+             issues, so it needs Contents and Issues: read and write"
+        );
+    }
+    if webhook {
+        let hooks = gh
+            .send(Method::GET, &format!("repos/{repo}/hooks?per_page=1"), None)
+            .await?;
+        if !hooks.ok() {
+            bail!(
+                "{repo}: cannot list webhooks (HTTP {}); the token needs Webhooks: read and write, \
+                 or pass --no-webhook and register the webhook yourself",
+                hooks.status
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn issue_count(gh: &GitHub, repo: &str, state: &str) -> Result<u64> {
+    let found = gh
+        .get(&format!(
+            "search/issues?q=repo:{repo}+is:issue+is:{state}&per_page=1"
+        ))
+        .await?;
+    Ok(found["total_count"].as_u64().unwrap_or(0))
+}
+
+pub async fn label_counts(gh: &GitHub, repo: &str) -> Result<Vec<(String, usize)>> {
+    let labels = gh
+        .get_all(&format!("repos/{repo}/labels?per_page=100"))
+        .await?;
+    Ok(["type::", "priority::", "status::"]
+        .iter()
+        .map(|prefix| {
+            let count = labels
+                .iter()
+                .filter(|l| l["name"].as_str().is_some_and(|n| n.starts_with(prefix)))
+                .count();
+            (prefix.to_string(), count)
+        })
+        .collect())
+}

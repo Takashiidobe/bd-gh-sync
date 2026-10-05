@@ -48,7 +48,7 @@ pub async fn push(config: Config, repo: &str) -> Result<()> {
     project.push(&config, &secrets).await
 }
 
-pub async fn add(config: Config, repo: &str, no_webhook: bool) -> Result<()> {
+pub async fn add(config: Config, repo: &str, no_webhook: bool, dry_run: bool) -> Result<()> {
     let secrets = Secrets::from_env()?;
     require_projects_token(&config, &secrets)?;
     let webhook_url = if no_webhook {
@@ -57,6 +57,11 @@ pub async fn add(config: Config, repo: &str, no_webhook: bool) -> Result<()> {
         Some(config.webhook_url()?)
     };
     let project = Project::new(&config.data_dir, repo)?;
+    let gh = GitHub::new(&config.api_url, &secrets.token);
+    github::preflight(&gh, repo, webhook_url.is_some()).await?;
+    if dry_run {
+        return preview(&gh, &project, webhook_url.as_deref()).await;
+    }
     if project.exists() {
         info!(project = %repo, "already cloned at {}", project.dir.display());
     } else {
@@ -68,7 +73,6 @@ pub async fn add(config: Config, repo: &str, no_webhook: bool) -> Result<()> {
         .await
         .context("initial sync failed")?;
     if let Some(url) = webhook_url {
-        let gh = GitHub::new(&config.api_url, &secrets.token);
         let secret = config::ensure_repo_secret(&config.data_dir, repo)?;
         let verb = match github::register_webhook(&gh, repo, &url, &secret).await? {
             github::Registered::Created => "created",
@@ -76,6 +80,30 @@ pub async fn add(config: Config, repo: &str, no_webhook: bool) -> Result<()> {
         };
         info!(project = %repo, "webhook {verb}: {url}");
     }
+    Ok(())
+}
+
+async fn preview(gh: &GitHub, project: &Project, webhook_url: Option<&str>) -> Result<()> {
+    println!("{}: the token can reach this repository", project.repo);
+    let open = github::issue_count(gh, &project.repo, "open").await?;
+    let closed = github::issue_count(gh, &project.repo, "closed").await?;
+    println!("  issues to import: {open} open, {closed} closed");
+    for (prefix, count) in github::label_counts(gh, &project.repo).await? {
+        println!("  {count} existing {prefix}* label(s)");
+    }
+    println!(
+        "  clone: {}",
+        if project.exists() {
+            format!("already at {}", project.dir.display())
+        } else {
+            format!("would be created at {}", project.dir.display())
+        }
+    );
+    match webhook_url {
+        Some(url) => println!("  webhook: would be registered at {url}"),
+        None => println!("  webhook: not managed (--no-webhook)"),
+    }
+    println!("nothing was changed; run again without --dry-run to set it up");
     Ok(())
 }
 

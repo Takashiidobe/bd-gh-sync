@@ -1,6 +1,7 @@
 mod bd;
 mod github;
 mod ids;
+mod init;
 mod relay;
 mod server;
 mod sync;
@@ -52,6 +53,18 @@ enum Command {
         repo: String,
     },
     #[command(about = "Run the webhook server that syncs many repositories")]
+    #[command(
+        about = "Set up this clone: repository, Dolt remote check, first push, optional service"
+    )]
+    Init {
+        #[arg(long, help = "owner/name [default: bd's setting, else the git remote]")]
+        repo: Option<String>,
+        #[arg(
+            long,
+            help = "Also install and start the watcher as a systemd user service"
+        )]
+        install_service: bool,
+    },
     #[command(about = "Show what a running server is doing: queue, last push and sync, Dolt heads")]
     Status {
         #[arg(
@@ -202,6 +215,11 @@ enum ServerCommand {
         repo: String,
         #[arg(long, help = "Don't create or update the repository webhook")]
         no_webhook: bool,
+        #[arg(
+            long,
+            help = "Check the token and show what would be imported; change nothing"
+        )]
+        dry_run: bool,
     },
     #[command(about = "Sync one project now (while the server is stopped, or to debug)")]
     Sync {
@@ -297,14 +315,26 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Command::Init {
+            repo,
+            install_service,
+        } => {
+            init::run(init::Options {
+                repo,
+                install_service,
+            })
+            .await
+        }
         Command::Status { url, secret } => server::status::show(&url, &secret).await,
         Command::Server { config, command } => {
             let config = Config::load(&config)?;
             match command {
                 ServerCommand::Serve => server::serve(config).await,
-                ServerCommand::Add { repo, no_webhook } => {
-                    server::add(config, &repo, no_webhook).await
-                }
+                ServerCommand::Add {
+                    repo,
+                    no_webhook,
+                    dry_run,
+                } => server::add(config, &repo, no_webhook, dry_run).await,
                 ServerCommand::Sync { repo, issues, all } => {
                     server::sync(config, &repo, mode(issues, false, all)).await
                 }
