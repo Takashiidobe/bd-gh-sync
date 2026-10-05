@@ -39,6 +39,15 @@ enum Command {
     Sync(SyncArgs),
     #[command(about = "Push local bead changes to GitHub issues as they happen")]
     Watch(WatchArgs),
+    #[command(about = "Compare every linked bead with its GitHub issue and print the drift")]
+    Verify {
+        #[arg(
+            long,
+            env = "GITHUB_REPOSITORY",
+            help = "owner/name of the GitHub repository"
+        )]
+        repo: String,
+    },
     #[command(about = "Run the webhook server that syncs many repositories")]
     Server {
         #[arg(
@@ -202,6 +211,17 @@ async fn main() -> Result<()> {
                 .env("BD_NON_INTERACTIVE", "1")
                 .env("BD_NO_DEP_TYPE_WARNING", "1");
             sync::run(&wd, &GitHub::from_env()?, &opts).await
+        }
+        Command::Verify { repo } => {
+            let wd = Workdir::new(std::env::current_dir()?)
+                .env("BD_NON_INTERACTIVE", "1")
+                .env("BD_NO_DEP_TYPE_WARNING", "1");
+            let drift = sync::verify(&wd, &GitHub::from_env()?, &repo).await?;
+            if drift > 0 {
+                bail!("{drift} difference(s) between beads and GitHub");
+            }
+            println!("beads and GitHub agree");
+            Ok(())
         }
         Command::Watch(args) => {
             watch::run(watch::Options {

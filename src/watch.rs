@@ -16,7 +16,10 @@ use crate::{
     bd::{Bd, Bead, Workdir},
     github::{DEFAULT_API_URL, GitHub, Response},
     ids,
-    sync::{COMMENT_MARKER, is_sync_note, normalize, state_reason_for},
+    sync::{
+        COMMENT_MARKER, PRIORITIES, TEXT_LIMIT, TextAction, TextField, TextState, is_sync_note,
+        normalize, reconcile_text, rejoin_parts, split_text, state_reason_for,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -102,6 +105,38 @@ pub fn fingerprint(bead: &Bead) -> String {
         "labels": labels,
     })
     .to_string()
+}
+
+fn state_of(have: &BTreeMap<usize, (u64, String)>, text: &str) -> TextState {
+    let mut ids = have.values().map(|(id, _)| *id);
+    TextState {
+        id: ids.next(),
+        more: ids.collect(),
+        text: text.to_string(),
+    }
+}
+
+fn matches_issue(bead: &Bead, issue: &Value) -> bool {
+    let text = |value: &Value| normalize(value.as_str().unwrap_or_default());
+    let labels: Vec<&str> = issue["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["name"].as_str())
+        .collect();
+    let priority = bead
+        .priority
+        .as_u64()
+        .and_then(|p| PRIORITIES.get(p as usize));
+    text(&bead.title) == text(&issue["title"])
+        && normalize(bead.description.as_deref().unwrap_or_default()) == text(&issue["body"])
+        && bead.is_closed() == (issue["state"] == "closed")
+        && (bead.status.as_str() == Some("in_progress")) == labels.contains(&"status::in_progress")
+        && bead
+            .issue_type
+            .as_str()
+            .is_some_and(|t| labels.contains(&format!("type::{t}").as_str()))
+        && priority.is_some_and(|p| labels.contains(&format!("priority::{p}").as_str()))
 }
 
 fn ignored(path: &Path) -> bool {
@@ -262,14 +297,19 @@ impl Watcher {
         }
         let assignees = self.step("assignees", self.push_assignees(&beads).await);
         let deleted = self.step("deleted beads", self.push_deleted(&beads).await);
-        let close_reasons = self.step("close reasons", self.push_close_reasons(&beads).await);
         let comments = self.step("comments", self.push_comments(&beads).await);
+        let texts = self.step(
+            "design, acceptance and notes",
+            self.push_texts(&beads).await,
+        );
+        let close_reasons = self.step("close reasons", self.push_close_reasons(&beads).await);
         let relations = self.step("relations", self.push_relations(&beads).await);
         fields
             .merge(assignees)
             .merge(deleted)
             .merge(close_reasons)
             .merge(comments)
+            .merge(texts)
             .merge(relations)
     }
 
@@ -368,11 +408,32 @@ impl Watcher {
             .into_iter()
             .filter(|(id, _)| current.contains_key(id))
             .collect();
-        let changed: Vec<String> = current
+        let mut changed: Vec<String> = current
             .iter()
             .filter(|(id, fp)| kept.get(*id) != Some(fp))
             .map(|(id, _)| id.clone())
             .collect();
+        let links = links(beads);
+        let mut adopted = false;
+        for id in changed.clone() {
+            let (Some(path), Some(bead)) = (links.get(&id), beads.iter().find(|b| b.id == id))
+            else {
+                continue;
+            };
+            if kept.contains_key(&id) {
+                continue;
+            }
+            let resp = self.call(Method::GET, path, None).await;
+            if resp.ok() && matches_issue(bead, &resp.body) {
+                info!("{id}: already matches {path}; not pushing it back");
+                kept.insert(id.clone(), current[&id].clone());
+                changed.retain(|c| *c != id);
+                adopted = true;
+            }
+        }
+        if adopted {
+            self.save("pushed.json", &kept)?;
+        }
         if changed.is_empty() {
             self.save("pushed.json", &kept)?;
             return Ok(Outcome::Nothing);
@@ -729,6 +790,36 @@ impl Watcher {
         Ok(outcome)
     }
 
+    async fn dedupe(&self, path: &str, marker: &str, mine: Option<u64>) -> Result<Option<u64>> {
+        let (repo, _) = path.rsplit_once("/issues/").context("not an issue path")?;
+        let existing = self
+            .gh
+            .get_all(&format!("{path}/comments?per_page=100"))
+            .await?;
+        let mut ours: Vec<u64> = existing
+            .iter()
+            .filter(|c| c["body"].as_str().unwrap_or_default().contains(marker))
+            .filter_map(|c| c["id"].as_u64())
+            .collect();
+        ours.sort_unstable();
+        let Some(&keep) = ours.first() else {
+            return Ok(mine);
+        };
+        for extra in ours.iter().skip(1) {
+            let resp = self
+                .call(
+                    Method::DELETE,
+                    &format!("{repo}/issues/comments/{extra}"),
+                    None,
+                )
+                .await;
+            if resp.ok() {
+                info!("deleted duplicate comment {extra} on {path}");
+            }
+        }
+        Ok(Some(keep))
+    }
+
     async fn post_close_reason(&self, path: &str, reason: &str) -> Result<bool> {
         let marker = format!("{COMMENT_MARKER}close-reason -->");
         let existing = self
@@ -749,6 +840,9 @@ impl Watcher {
             .await;
         if !resp.ok() {
             bail!("HTTP {}", resp.status);
+        }
+        if let Err(e) = self.dedupe(path, &marker, None).await {
+            warn!("could not check {path} for duplicate close reasons: {e:#}");
         }
         Ok(true)
     }
@@ -850,6 +944,9 @@ impl Watcher {
                 if resp.ok() {
                     info!("{bead}: posted a comment");
                     outcome.pushed();
+                    if let Err(e) = self.dedupe(path, &marker, None).await {
+                        warn!("{bead}: could not check for duplicate comments: {e:#}");
+                    }
                 } else if resp.permanent_failure() {
                     warn!(
                         "{bead}: GitHub refused a comment (HTTP {}); not retrying",
@@ -872,6 +969,178 @@ impl Watcher {
         handled.retain(|h| current.iter().any(|c| c.0 == h));
         self.save(file, &handled)?;
         Ok(outcome)
+    }
+
+    async fn push_texts(&self, beads: &[Bead]) -> Result<Outcome> {
+        let file = "texts.json";
+        let links = links(beads);
+        let mut state: BTreeMap<String, BTreeMap<String, TextState>> =
+            self.load(file).unwrap_or_default();
+
+        let mut outcome = Outcome::Nothing;
+        'beads: for bead in beads {
+            let Some(path) = links.get(&bead.id) else {
+                continue;
+            };
+            for field in TextField::ALL {
+                let text = normalize(field.of(bead));
+                let synced = state
+                    .get(&bead.id)
+                    .and_then(|fields| fields.get(field.key()))
+                    .cloned();
+                if synced.as_ref().map_or(text.is_empty(), |s| s.text == text) {
+                    continue;
+                }
+                if self.rate_limited() {
+                    outcome = Outcome::Failed;
+                    break 'beads;
+                }
+                if self.opts.dry_run {
+                    info!("would push the {} of {}", field.key(), bead.id);
+                    outcome.pushed();
+                    continue;
+                }
+                match self.push_text(path, field, &text, synced).await {
+                    Ok(next) => {
+                        let fields = state.entry(bead.id.clone()).or_default();
+                        match next {
+                            Some(next) => fields.insert(field.key().to_string(), next),
+                            None => fields.remove(field.key()),
+                        };
+                        info!("{}: synced the {}", bead.id, field.key());
+                        outcome.pushed();
+                        state.retain(|_, fields| !fields.is_empty());
+                        self.save(file, &state)?;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "{}: could not push the {}; will retry: {e:#}",
+                            bead.id,
+                            field.key()
+                        );
+                        outcome = Outcome::Failed;
+                    }
+                }
+            }
+        }
+        state.retain(|id, fields| !fields.is_empty() && beads.iter().any(|b| &b.id == id));
+        self.save(file, &state)?;
+        Ok(outcome)
+    }
+
+    async fn push_text(
+        &self,
+        path: &str,
+        field: TextField,
+        text: &str,
+        synced: Option<TextState>,
+    ) -> Result<Option<TextState>> {
+        let (repo, _) = path.rsplit_once("/issues/").context("not an issue path")?;
+        let existing = self
+            .gh
+            .get_all(&format!("{path}/comments?per_page=100"))
+            .await?;
+        let mut have: BTreeMap<usize, (u64, String)> = BTreeMap::new();
+        for comment in &existing {
+            let body = comment["body"].as_str().unwrap_or_default();
+            if let (Some(part), Some(id)) = (field.part_of(body), comment["id"].as_u64()) {
+                have.entry(part).or_insert((id, normalize(body)));
+            }
+        }
+        let comment_path = |id: u64| format!("{repo}/issues/comments/{id}");
+        if text.is_empty() {
+            for (id, _) in have.values() {
+                let resp = self.call(Method::DELETE, &comment_path(*id), None).await;
+                if !resp.ok() && !matches!(resp.status, 404 | 410) {
+                    bail!("deleting comment {id}: HTTP {}", resp.status);
+                }
+            }
+            return Ok(None);
+        }
+
+        let synced_text = synced.as_ref().map(|s| s.text.clone());
+        let on_github: Vec<String> = have.values().map(|(_, body)| field.text_of(body)).collect();
+        let mut references = vec![text];
+        references.extend(synced_text.as_deref());
+        let github = (!have.is_empty()).then(|| rejoin_parts(&on_github, &references));
+        if let Some(github) = &github {
+            let base = synced_text.unwrap_or_else(|| github.clone());
+            match reconcile_text(text, github, &base) {
+                TextAction::Keep => return Ok(Some(state_of(&have, text))),
+                TextAction::Conflict => {
+                    let kept = split_text(github, TEXT_LIMIT);
+                    for (i, chunk) in kept.iter().enumerate() {
+                        let body = json!({"body": field.overwritten(chunk, i + 1, kept.len())});
+                        let resp = self
+                            .call(Method::POST, &format!("{path}/comments"), Some(&body))
+                            .await;
+                        if !resp.ok() && !resp.permanent_failure() {
+                            bail!("preserving the GitHub edit: HTTP {}", resp.status);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let wanted = split_text(text, TEXT_LIMIT);
+        for (i, chunk) in wanted.iter().enumerate() {
+            let part = i + 1;
+            let body = field.part_body(chunk, part, wanted.len());
+            let payload = json!({"body": body});
+            match have.get(&part) {
+                Some((_, old)) if *old == normalize(&body) => {}
+                Some((id, _)) => {
+                    let resp = self
+                        .call(Method::PATCH, &comment_path(*id), Some(&payload))
+                        .await;
+                    if !resp.ok() {
+                        return self.refused(resp.status, resp.permanent_failure(), &have, text);
+                    }
+                }
+                None => {
+                    let resp = self
+                        .call(Method::POST, &format!("{path}/comments"), Some(&payload))
+                        .await;
+                    if !resp.ok() {
+                        return self.refused(resp.status, resp.permanent_failure(), &have, text);
+                    }
+                    let id = resp.body["id"].as_u64();
+                    let marker = field.part_marker(part);
+                    let kept = match self.dedupe(path, &marker, id).await {
+                        Ok(kept) => kept,
+                        Err(e) => {
+                            warn!("could not check {path} for duplicate comments: {e:#}");
+                            id
+                        }
+                    };
+                    if let Some(id) = kept {
+                        have.insert(part, (id, normalize(&body)));
+                    }
+                }
+            }
+        }
+        for (part, (id, _)) in have.clone() {
+            if part > wanted.len() {
+                self.call(Method::DELETE, &comment_path(id), None).await;
+                have.remove(&part);
+            }
+        }
+        Ok(Some(state_of(&have, text)))
+    }
+
+    fn refused(
+        &self,
+        status: u16,
+        permanent: bool,
+        have: &BTreeMap<usize, (u64, String)>,
+        text: &str,
+    ) -> Result<Option<TextState>> {
+        if !permanent {
+            bail!("HTTP {status}");
+        }
+        warn!("GitHub refused the text (HTTP {status}); not retrying");
+        Ok(Some(state_of(have, text)))
     }
 
     async fn push_relations(&self, beads: &[Bead]) -> Result<Outcome> {

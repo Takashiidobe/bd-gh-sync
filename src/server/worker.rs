@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
+use serde_json::json;
 use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     time::{Instant, timeout_at},
@@ -13,6 +15,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
+    github::GitHub,
     server::{
         config::{Config, Secrets},
         project::Project,
@@ -24,6 +27,7 @@ use crate::{
 pub enum Job {
     Issues(BTreeSet<u64>),
     Changes(Vec<Change>),
+    Pulls(BTreeSet<u64>),
     SinceLast,
 }
 
@@ -31,6 +35,7 @@ pub enum Job {
 pub struct Batch {
     issues: BTreeSet<u64>,
     changes: Vec<Change>,
+    pulls: BTreeSet<u64>,
     since_last: bool,
 }
 
@@ -39,12 +44,16 @@ impl Batch {
         match job {
             Job::Issues(issues) => self.issues.extend(issues),
             Job::Changes(changes) => self.changes.extend(changes),
+            Job::Pulls(pulls) => self.pulls.extend(pulls),
             Job::SinceLast => self.since_last = true,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.issues.is_empty() && self.changes.is_empty() && !self.since_last
+        self.issues.is_empty()
+            && self.changes.is_empty()
+            && self.pulls.is_empty()
+            && !self.since_last
     }
 
     pub fn mode(&self) -> Mode {
@@ -111,10 +120,14 @@ fn deliveries_path(ctx: &Context) -> PathBuf {
     ctx.config.data_dir.join(".deliveries")
 }
 
+const MAX_BAD_SIGNATURES: u32 = 10;
+const BAD_SIGNATURE_WINDOW: Duration = Duration::from_secs(60);
+
 pub struct Workers {
     ctx: Arc<Context>,
     queues: Mutex<HashMap<String, UnboundedSender<Job>>>,
     deliveries: Mutex<Deliveries>,
+    bad_signatures: Mutex<HashMap<String, (u32, std::time::Instant)>>,
 }
 
 impl Workers {
@@ -129,7 +142,23 @@ impl Workers {
             ctx,
             queues: Mutex::default(),
             deliveries: Mutex::new(deliveries),
+            bad_signatures: Mutex::default(),
         }
+    }
+
+    pub fn blocked(&self, source: &str) -> bool {
+        let mut seen = self.bad_signatures.lock().unwrap();
+        seen.retain(|_, (_, at)| at.elapsed() < BAD_SIGNATURE_WINDOW);
+        seen.get(source)
+            .is_some_and(|(count, _)| *count >= MAX_BAD_SIGNATURES)
+    }
+
+    pub fn bad_signature(&self, source: &str) {
+        let mut seen = self.bad_signatures.lock().unwrap();
+        let entry = seen
+            .entry(source.to_string())
+            .or_insert((0, std::time::Instant::now()));
+        entry.0 += 1;
     }
 
     pub fn seen_delivery(&self, id: &str) -> bool {
@@ -176,6 +205,47 @@ impl Workers {
     }
 }
 
+async fn closing_issues(
+    gh: &GitHub,
+    repo: &str,
+    pulls: &BTreeSet<u64>,
+) -> anyhow::Result<BTreeSet<u64>> {
+    let (owner, name) = repo
+        .split_once('/')
+        .context("repository must be owner/name")?;
+    let mut issues = BTreeSet::new();
+    for number in pulls {
+        let data = gh
+            .graphql(
+                "query($owner: String!, $repo: String!, $number: Int!) {
+                   repository(owner: $owner, name: $repo) {
+                     pullRequest(number: $number) {
+                       closingIssuesReferences(first: 50) {
+                         nodes { number repository { nameWithOwner } }
+                       }
+                     }
+                   }
+                 }",
+                json!({"owner": owner, "repo": name, "number": number}),
+            )
+            .await?;
+        let nodes = data["repository"]["pullRequest"]["closingIssuesReferences"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten();
+        issues.extend(
+            nodes
+                .filter(|n| {
+                    n["repository"]["nameWithOwner"]
+                        .as_str()
+                        .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+                })
+                .filter_map(|n| n["number"].as_u64()),
+        );
+    }
+    Ok(issues)
+}
+
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 
 async fn run(
@@ -185,7 +255,18 @@ async fn run(
     mut rx: UnboundedReceiver<Job>,
 ) {
     let config = &ctx.config;
-    while let Some(batch) = next_batch(&mut rx, config.debounce(), config.max_wait()).await {
+    while let Some(mut batch) = next_batch(&mut rx, config.debounce(), config.max_wait()).await {
+        if !batch.pulls.is_empty() {
+            let gh = GitHub::new(&config.api_url, &ctx.secrets.token);
+            match closing_issues(&gh, &project.repo, &batch.pulls).await {
+                Ok(issues) => batch.issues.extend(issues),
+                Err(e) => {
+                    warn!(project = %project.repo, "could not resolve pull requests: {e:#}; scanning instead");
+                    batch.since_last = true;
+                }
+            }
+            batch.pulls.clear();
+        }
         if batch.is_empty() {
             continue;
         }

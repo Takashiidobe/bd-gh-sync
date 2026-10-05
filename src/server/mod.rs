@@ -4,13 +4,13 @@ pub mod projects;
 pub mod webhook;
 pub mod worker;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context as _, Result, bail};
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -61,7 +61,8 @@ pub async fn add(config: Config, repo: &str, no_webhook: bool) -> Result<()> {
         .context("initial sync failed")?;
     if let Some(url) = webhook_url {
         let gh = GitHub::new(&config.api_url, &secrets.token);
-        let verb = match github::register_webhook(&gh, repo, &url, &secrets.webhook_secret).await? {
+        let secret = config::ensure_repo_secret(&config.data_dir, repo)?;
+        let verb = match github::register_webhook(&gh, repo, &url, &secret).await? {
             github::Registered::Created => "created",
             github::Registered::Updated => "updated",
         };
@@ -98,15 +99,18 @@ pub async fn serve(config: Config) -> Result<()> {
     let app = Router::new()
         .route("/webhook", post(receive))
         .route("/healthz", get(|| async { "ok" }))
-        .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(workers);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("listening on {listen}"))?;
     info!("listening on {}", listener.local_addr()?);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     Ok(())
 }
 
@@ -126,23 +130,41 @@ pub async fn shutdown() {
     }
 }
 
+const MAX_BODY: usize = 1024 * 1024;
+
 async fn receive(
     State(workers): State<Arc<Workers>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, String) {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let secret = workers.context().secrets.webhook_secret.as_bytes();
-    if !webhook::verify(secret, &body, header("x-hub-signature-256")) {
-        warn!("rejected a webhook with a bad signature");
+    let source = header("x-forwarded-for")
+        .and_then(|list| list.split(',').next())
+        .map_or_else(|| peer.ip().to_string(), |ip| ip.trim().to_string());
+    if workers.blocked(&source) {
+        warn!("rejected a webhook from {source}: too many bad signatures");
+        return (StatusCode::TOO_MANY_REQUESTS, "too many failures".into());
+    }
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            workers.bad_signature(&source);
+            return (StatusCode::BAD_REQUEST, format!("bad JSON: {e}"));
+        }
+    };
+    let context = workers.context();
+    let secret = payload["repository"]["full_name"]
+        .as_str()
+        .and_then(|repo| config::repo_secret(&context.config.data_dir, repo))
+        .unwrap_or_else(|| context.secrets.webhook_secret.clone());
+    if !webhook::verify(secret.as_bytes(), &body, header("x-hub-signature-256")) {
+        workers.bad_signature(&source);
+        warn!("rejected a webhook from {source} with a bad signature");
         return (StatusCode::UNAUTHORIZED, "bad signature".into());
     }
     let Some(event) = header("x-github-event") else {
         return (StatusCode::BAD_REQUEST, "missing X-GitHub-Event".into());
-    };
-    let payload = match serde_json::from_slice(&body) {
-        Ok(payload) => payload,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
     };
     let delivery = header("x-github-delivery");
     if let Some(id) = delivery.filter(|id| workers.seen_delivery(id)) {
@@ -187,7 +209,7 @@ fn handle(
         Event::Ignored(why) => return Ok((StatusCode::ACCEPTED, format!("ignored: {why}"))),
         Event::Sync { repo, issues } => (repo, Job::Issues(issues)),
         Event::Changes { repo, changes } => (repo, Job::Changes(changes)),
-        Event::Reconcile { repo } => (repo, Job::SinceLast),
+        Event::Pulls { repo, numbers } => (repo, Job::Pulls(numbers)),
     };
     let Some(project) = Project::find(&workers.context().config.data_dir, &repo)? else {
         return Ok((

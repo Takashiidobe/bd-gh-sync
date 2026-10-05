@@ -68,7 +68,7 @@ const TYPES: &[&str] = &[
     "story",
     "milestone",
 ];
-const PRIORITIES: &[&str] = &["critical", "high", "medium", "low", "backlog"];
+pub const PRIORITIES: &[&str] = &["critical", "high", "medium", "low", "backlog"];
 const IN_PROGRESS_LABEL: &str = "status::in_progress";
 
 pub fn known_label(label: &str) -> bool {
@@ -179,6 +179,7 @@ const TOMBSTONE: &str = "~";
 const APPLIED_KEY: &str = "applied";
 
 type Marks = BTreeMap<String, String>;
+type Texts = BTreeMap<u64, BTreeMap<String, TextState>>;
 
 impl Change {
     fn mark(&self) -> Option<(String, String)> {
@@ -247,13 +248,19 @@ pub const COMMENT_MARKER: &str = "<!-- bd-comment:";
 pub const LINKED_PR_COMMENT: &str = "Linked pull request:";
 const EDITED_COMMENT: &str = "Edited on GitHub:";
 const DELETED_COMMENT: &str = "Deleted on GitHub:";
+const OVERWRITTEN_COMMENT: &str = "Overwritten GitHub edit";
 const CLOSE_COMMENT_WINDOW: Duration = Duration::from_secs(10);
 const FRESH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub fn is_sync_note(text: &str) -> bool {
-    [LINKED_PR_COMMENT, EDITED_COMMENT, DELETED_COMMENT]
-        .iter()
-        .any(|prefix| text.starts_with(prefix))
+    [
+        LINKED_PR_COMMENT,
+        EDITED_COMMENT,
+        DELETED_COMMENT,
+        OVERWRITTEN_COMMENT,
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
 }
 const ATTEMPTS: u32 = 5;
 
@@ -295,6 +302,30 @@ pub async fn run(wd: &Workdir, gh: &GitHub, opts: &Options) -> Result<()> {
     result
 }
 
+pub async fn verify(wd: &Workdir, gh: &GitHub, repo: &str) -> Result<usize> {
+    let opts = Options {
+        repo: repo.to_string(),
+        mode: Mode::All,
+        publish: false,
+        transport: Transport::Jsonl,
+        jsonl: PathBuf::from(".beads/issues.jsonl"),
+        adopt_bd_created: false,
+        commit_message: String::new(),
+    };
+    let sync = Sync {
+        wd,
+        bd: Bd::new(wd),
+        gh,
+        opts: &opts,
+        transport: Transport::Jsonl,
+        mode: Mode::All,
+        next_since: String::new(),
+        state_file: PathBuf::new(),
+        marks: Default::default(),
+    };
+    sync.drift().await
+}
+
 async fn resolve_transport(wd: &Workdir, bd: &Bd<'_>, wanted: Transport) -> Result<Transport> {
     if wanted != Transport::Auto {
         return Ok(wanted);
@@ -322,6 +353,7 @@ struct GithubLinks {
     mentions: BTreeSet<String>,
     pulls: BTreeMap<String, (u64, String)>,
     duplicates: BTreeMap<u64, u64>,
+    truncated: BTreeSet<u64>,
 }
 
 #[derive(Default)]
@@ -431,12 +463,30 @@ pub fn linked(beads: &[Bead], repo: &str) -> BTreeMap<u64, String> {
 }
 
 pub fn state_reason_for(close_reason: &str) -> &'static str {
-    let reason = close_reason.to_lowercase();
-    if reason.contains("duplicate") {
+    let reason = close_reason.trim().to_lowercase();
+    let leads = |keyword: &str| {
+        reason.strip_prefix(keyword).is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with([':', ',', '.', ';', '(', '!'])
+                || [" of ", " as ", " -", " (", " #"]
+                    .iter()
+                    .any(|sep| rest.starts_with(sep))
+        })
+    };
+    if ["duplicate", "dupe", "dup"].iter().any(|k| leads(k)) {
         "duplicate"
-    } else if ["won't", "wont", "not planned", "not_planned", "invalid"]
-        .iter()
-        .any(|s| reason.contains(s))
+    } else if [
+        "won't fix",
+        "wont fix",
+        "wontfix",
+        "won't do",
+        "wont do",
+        "not planned",
+        "not_planned",
+        "invalid",
+    ]
+    .iter()
+    .any(|k| leads(k))
     {
         "not_planned"
     } else {
@@ -455,6 +505,196 @@ fn close_reason_for(state_reason: &str) -> Option<&'static str> {
 
 pub fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n").trim().to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TextField {
+    Design,
+    Acceptance,
+    Notes,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TextState {
+    pub id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more: Vec<u64>,
+    pub text: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TextAction {
+    Keep,
+    PushBead,
+    ImportGithub,
+    Conflict,
+}
+
+impl TextField {
+    pub const ALL: [TextField; 3] = [TextField::Design, TextField::Acceptance, TextField::Notes];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            TextField::Design => "design",
+            TextField::Acceptance => "acceptance",
+            TextField::Notes => "notes",
+        }
+    }
+
+    pub fn flag(self) -> &'static str {
+        match self {
+            TextField::Design => "--design",
+            TextField::Acceptance => "--acceptance",
+            TextField::Notes => "--notes",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            TextField::Design => "Design",
+            TextField::Acceptance => "Acceptance criteria",
+            TextField::Notes => "Notes",
+        }
+    }
+
+    pub fn marker(self) -> String {
+        format!("{COMMENT_MARKER}{} -->", self.key())
+    }
+
+    pub fn of(self, bead: &Bead) -> &str {
+        match self {
+            TextField::Design => &bead.design,
+            TextField::Acceptance => &bead.acceptance_criteria,
+            TextField::Notes => &bead.notes,
+        }
+        .as_deref()
+        .unwrap_or_default()
+    }
+
+    pub fn part_marker(self, part: usize) -> String {
+        if part == 1 {
+            self.marker()
+        } else {
+            format!("{COMMENT_MARKER}{}:{part} -->", self.key())
+        }
+    }
+
+    pub fn part_body(self, text: &str, part: usize, parts: usize) -> String {
+        let title = match parts {
+            1 => self.title().to_string(),
+            _ => format!("{} (part {part}/{parts})", self.title()),
+        };
+        format!("**{title}**\n\n{text}\n\n{}", self.part_marker(part))
+    }
+
+    pub fn overwritten(self, text: &str, part: usize, parts: usize) -> String {
+        let suffix = match parts {
+            1 => String::new(),
+            _ => format!(" (part {part}/{parts})"),
+        };
+        format!(
+            "{OVERWRITTEN_COMMENT} to the {}{suffix}:\n\n{text}",
+            self.title()
+        )
+    }
+
+    pub fn part_of(self, body: &str) -> Option<usize> {
+        if body.contains(&self.marker()) {
+            return Some(1);
+        }
+        let start = format!("{COMMENT_MARKER}{}:", self.key());
+        let rest = &body[body.find(&start)? + start.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        rest[digits.len()..]
+            .starts_with(" -->")
+            .then(|| digits.parse().ok())
+            .flatten()
+    }
+
+    pub fn marked(body: &str) -> Option<TextField> {
+        Self::ALL.into_iter().find(|f| f.part_of(body).is_some())
+    }
+
+    pub fn text_of(self, body: &str) -> String {
+        let mut text = body.to_string();
+        let start = format!("{COMMENT_MARKER}{}", self.key());
+        while let Some(at) = text.find(&start) {
+            let rest = &text[at + start.len()..];
+            let digits = rest.strip_prefix(':').map_or(0, |tail| {
+                1 + tail.chars().take_while(char::is_ascii_digit).count()
+            });
+            let end = if rest[digits..].starts_with(" -->") {
+                at + start.len() + digits + " -->".len()
+            } else {
+                at + start.len()
+            };
+            text.replace_range(at..end, "");
+        }
+        let text = normalize(&text);
+        let header = format!("**{}", self.title());
+        match text.split_once('\n') {
+            Some((first, rest)) if first.starts_with(&header) && first.ends_with("**") => {
+                normalize(rest)
+            }
+            _ => text,
+        }
+    }
+}
+
+pub const TEXT_LIMIT: usize = 60_000;
+
+fn cut_point(window: &str) -> Option<usize> {
+    let fences: Vec<usize> = window.match_indices("```").map(|(i, _)| i).collect();
+    let limit = match fences.last() {
+        Some(&open) if fences.len() % 2 == 1 && open > 0 => open,
+        _ => window.len(),
+    };
+    let head = &window[..limit];
+    let floor = head.len() / 2;
+    let sentence = head
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '.' | '!' | '?'))
+        .map(|(i, c)| i + c.len_utf8())
+        .rfind(|end| head[*end..].starts_with(char::is_whitespace));
+    let after = |found: Option<usize>| found.filter(|at| *at >= floor && *at > 0);
+    after(sentence)
+        .or_else(|| after(head.rfind("\n\n")))
+        .or_else(|| after(head.rfind('\n')))
+        .or_else(|| after(head.rfind(char::is_whitespace)))
+        .or((limit < window.len() && limit > 0).then_some(limit))
+}
+
+pub fn split_text(text: &str, max: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = text.trim();
+    while rest.chars().count() > max {
+        let end = rest.char_indices().nth(max).map_or(rest.len(), |(i, _)| i);
+        let cut = cut_point(&rest[..end]).unwrap_or(end);
+        parts.push(normalize(&rest[..cut]));
+        rest = rest[cut..].trim_start();
+    }
+    parts.push(normalize(rest));
+    parts
+}
+
+pub fn rejoin_parts(parts: &[String], references: &[&str]) -> String {
+    references
+        .iter()
+        .find(|reference| split_text(reference, TEXT_LIMIT) == parts)
+        .map_or_else(|| parts.join("\n\n"), |reference| normalize(reference))
+}
+
+pub fn reconcile_text(bead: &str, github: &str, synced: &str) -> TextAction {
+    let (bead, github, synced) = (normalize(bead), normalize(github), normalize(synced));
+    if bead == github {
+        TextAction::Keep
+    } else if github == synced {
+        TextAction::PushBead
+    } else if bead == synced {
+        TextAction::ImportGithub
+    } else {
+        TextAction::Conflict
+    }
 }
 
 fn close_comment(github: &[Value], closing: &Closing) -> Option<(u64, String)> {
@@ -570,6 +810,7 @@ pub fn plan_relations(
     base: &BTreeSet<String>,
     have: &BTreeSet<String>,
     linked: &BTreeMap<u64, String>,
+    truncated: &BTreeSet<u64>,
 ) -> RelationPlan {
     let is_linked = |edge: &&String| {
         let parts: Vec<&str> = edge.split(' ').collect();
@@ -578,7 +819,9 @@ pub fn plan_relations(
                 .iter()
                 .all(|n| n.parse().is_ok_and(|n: u64| linked.contains_key(&n)))
     };
-    let remote: BTreeSet<String> = remote.iter().filter(is_linked).cloned().collect();
+    let cut = |edge: &String| truncated.contains(&edge_numbers(edge)[0]);
+    let mut remote: BTreeSet<String> = remote.iter().filter(is_linked).cloned().collect();
+    remote.extend(base.iter().filter(|e| cut(e)).cloned());
     RelationPlan {
         add: remote
             .difference(base)
@@ -596,12 +839,17 @@ pub fn plan_relations(
 
 const NODE_FIELDS: &str = r#"number
         parent { number repository { nameWithOwner } }
-        blockedBy(first: 100) { nodes { number repository { nameWithOwner } } }
+        blockedBy(first: 100) {
+          pageInfo { hasNextPage }
+          nodes { number repository { nameWithOwner } }
+        }
         duplicateOf { number repository { nameWithOwner } }
         closedByPullRequestsReferences(first: 10, includeClosedPrs: false) {
+          pageInfo { hasNextPage }
           nodes { url author { login } }
         }
         timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
+          pageInfo { hasNextPage }
           nodes {
             ... on CrossReferencedEvent {
               source { ... on Issue { number repository { nameWithOwner } } }
@@ -659,6 +907,153 @@ fn edge_beads(edge: &str, linked: &BTreeMap<u64, String>) -> Option<(String, Str
 impl Sync<'_> {
     fn repo(&self) -> &str {
         &self.opts.repo
+    }
+
+    async fn drift(&self) -> Result<usize> {
+        let repo = self.repo();
+        let beads = self.bd.export().await?;
+        let linked = linked(&beads, repo);
+        let issues: BTreeMap<u64, Value> = self
+            .gh
+            .get_all(&format!("repos/{repo}/issues?state=all&per_page=100"))
+            .await?
+            .into_iter()
+            .filter(|i| i["pull_request"].is_null())
+            .filter_map(|i| Some((i["number"].as_u64()?, i)))
+            .collect();
+        let mut found = 0;
+        let mut report = |n: u64, id: &str, what: String| {
+            println!("#{n} {id}: {what}");
+            found += 1;
+        };
+        for (n, id) in &linked {
+            let Some(bead) = beads.iter().find(|b| &b.id == id) else {
+                continue;
+            };
+            if bead.detached() {
+                continue;
+            }
+            let Some(issue) = issues.get(n) else {
+                report(*n, id, "issue not found on GitHub".into());
+                continue;
+            };
+            let text = |value: &Value| normalize(value.as_str().unwrap_or_default());
+            if text(&bead.title) != text(&issue["title"]) {
+                report(
+                    *n,
+                    id,
+                    format!("title differs: {:?}", text(&issue["title"])),
+                );
+            }
+            if normalize(bead.description.as_deref().unwrap_or_default()) != text(&issue["body"]) {
+                report(*n, id, "description differs".into());
+            }
+            if bead.is_closed() != (issue["state"] == "closed") {
+                report(
+                    *n,
+                    id,
+                    format!(
+                        "state differs: bead {}, GitHub {}",
+                        bead.status, issue["state"]
+                    ),
+                );
+            }
+            let labels: Vec<&str> = issue["labels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|l| l["name"].as_str())
+                .collect();
+            if let Some(kind) = bead.issue_type.as_str()
+                && !labels.contains(&format!("type::{kind}").as_str())
+            {
+                report(*n, id, format!("type label type::{kind} missing"));
+            }
+            if let Some(name) = bead
+                .priority
+                .as_u64()
+                .and_then(|p| PRIORITIES.get(p as usize))
+                && !labels.contains(&format!("priority::{name}").as_str())
+            {
+                report(*n, id, format!("priority label priority::{name} missing"));
+            }
+            if (bead.status.as_str() == Some("in_progress")) != labels.contains(&IN_PROGRESS_LABEL)
+                && !bead.is_closed()
+            {
+                report(*n, id, format!("{IN_PROGRESS_LABEL} label differs"));
+            }
+            let assignee = issue["assignee"]["login"].as_str().unwrap_or_default();
+            if bead.assignee.as_deref().unwrap_or_default() != assignee {
+                report(*n, id, format!("assignee differs: GitHub has {assignee:?}"));
+            }
+            let fields: Vec<(TextField, String)> = TextField::ALL
+                .into_iter()
+                .map(|f| (f, normalize(f.of(bead))))
+                .filter(|(_, text)| !text.is_empty())
+                .collect();
+            let comments: Vec<(String, String)> = bead
+                .comments()
+                .iter()
+                .filter(|c| !is_sync_note(&c.text))
+                .map(|c| (c.id.clone(), normalize(&c.text)))
+                .collect();
+            if comments.is_empty() && fields.is_empty() {
+                continue;
+            }
+            let github = match self
+                .gh
+                .get_all(&format!("repos/{repo}/issues/{n}/comments?per_page=100"))
+                .await
+            {
+                Ok(github) => github,
+                Err(e) => {
+                    report(*n, id, format!("could not read comments: {e:#}"));
+                    continue;
+                }
+            };
+            let bodies: Vec<&str> = github.iter().filter_map(|c| c["body"].as_str()).collect();
+            for (cid, text) in &comments {
+                let marker = format!("{COMMENT_MARKER}{cid} -->");
+                if !bodies
+                    .iter()
+                    .any(|b| b.contains(&marker) || normalize(b) == *text)
+                {
+                    report(*n, id, format!("comment {cid} is not on GitHub"));
+                }
+            }
+            for (field, want) in &fields {
+                match bodies.iter().find(|b| TextField::marked(b) == Some(*field)) {
+                    None => report(*n, id, format!("{} comment is missing", field.key())),
+                    Some(body) if field.text_of(body) != *want => {
+                        report(*n, id, format!("{} comment differs", field.key()))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        let GithubLinks { relations, .. } = self.github_relations(None).await?;
+        let have = relation_edges(&beads, &linked);
+        let remote: BTreeSet<String> = relations
+            .into_iter()
+            .filter(|edge| edge_numbers(edge).iter().all(|n| linked.contains_key(n)))
+            .collect();
+        for edge in have.difference(&remote) {
+            let n = edge_numbers(edge)[0];
+            report(
+                n,
+                &linked[&n],
+                format!("{}: only in the bead", edge_for_log(edge)),
+            );
+        }
+        for edge in remote.difference(&have) {
+            let n = edge_numbers(edge)[0];
+            report(
+                n,
+                &linked[&n],
+                format!("{}: only on GitHub", edge_for_log(edge)),
+            );
+        }
+        Ok(found)
     }
 
     async fn state_get(&self, key: &str) -> Result<Option<String>> {
@@ -968,6 +1363,61 @@ impl Sync<'_> {
         }
     }
 
+    async fn texts(&self) -> Result<Texts> {
+        match self.state_get("texts").await? {
+            Some(text) => serde_json::from_str(&text).context("parsing the recorded texts"),
+            None => Ok(Texts::new()),
+        }
+    }
+
+    async fn import_marked(&self, n: u64, bead: &Bead, comments: &[Value], texts: &mut Texts) {
+        for field in TextField::ALL {
+            let mut found: BTreeMap<usize, (u64, String)> = BTreeMap::new();
+            for comment in comments {
+                let body = comment["body"].as_str().unwrap_or_default();
+                if let (Some(part), Some(id)) = (field.part_of(body), comment["id"].as_u64()) {
+                    found.entry(part).or_insert((id, field.text_of(body)));
+                }
+            }
+            let Some(&(id, _)) = found.values().next() else {
+                continue;
+            };
+            let current = normalize(field.of(bead));
+            let synced = texts
+                .get(&n)
+                .and_then(|fields| fields.get(field.key()))
+                .map(|state| state.text.clone());
+            let parts: Vec<String> = found.values().map(|(_, text)| text.clone()).collect();
+            let mut references = vec![current.as_str()];
+            references.extend(synced.as_deref());
+            let github = rejoin_parts(&parts, &references);
+            let import = match &synced {
+                _ if current == github => false,
+                None => current.is_empty(),
+                Some(synced) => {
+                    reconcile_text(&current, &github, synced) == TextAction::ImportGithub
+                }
+            };
+            if import && !github.is_empty() {
+                if let Err(e) = self.bd.set_text(&bead.id, field.flag(), &github).await {
+                    warn!("#{n}: could not import the {}: {e:#}", field.key());
+                    continue;
+                }
+                info!("#{n}: imported the {} edited on GitHub", field.key());
+            } else if current != github {
+                continue;
+            }
+            texts.entry(n).or_default().insert(
+                field.key().to_string(),
+                TextState {
+                    id: Some(id),
+                    more: found.values().skip(1).map(|(id, _)| *id).collect(),
+                    text: github,
+                },
+            );
+        }
+    }
+
     async fn import_comments(
         &self,
         numbers: &[u64],
@@ -981,6 +1431,8 @@ impl Sync<'_> {
         let linked = linked(&beads, self.repo());
         let before = self.tracked_comments().await?;
         let mut all = before.clone();
+        let texts_before = self.texts().await?;
+        let mut texts = texts_before.clone();
         for n in numbers {
             let Some(id) = linked.get(n) else { continue };
             let Some(bead) = beads.iter().find(|b| &b.id == id) else {
@@ -1000,6 +1452,7 @@ impl Sync<'_> {
                     continue;
                 }
             };
+            self.import_marked(*n, bead, &github, &mut texts).await;
             let have: Vec<(String, String)> = bead
                 .comments()
                 .iter()
@@ -1008,7 +1461,8 @@ impl Sync<'_> {
             let previous = before.get(n).cloned().unwrap_or_default();
             let mut plan = plan_comments(&github, &have, &previous);
             for comment in &github {
-                if let (Some(cid), Some(at)) = (comment["id"].as_u64(), comment["updated_at"].as_str())
+                if let (Some(cid), Some(at)) =
+                    (comment["id"].as_u64(), comment["updated_at"].as_str())
                 {
                     self.mark(format!("{n}/{cid}"), at.to_string());
                 }
@@ -1046,12 +1500,101 @@ impl Sync<'_> {
                 all.insert(*n, tracked);
             }
         }
+        let texts_changed = texts != texts_before;
+        if texts_changed {
+            self.state_set("texts", &serde_json::to_string(&texts)?)
+                .await?;
+        }
         if all == before {
-            return Ok((false, from_comment));
+            return Ok((texts_changed, from_comment));
         }
         self.state_set("comments", &serde_json::to_string(&all)?)
             .await?;
         Ok((true, from_comment))
+    }
+
+    fn opening(&self, changes: &[Change], linked: &BTreeMap<u64, String>) -> BTreeSet<u64> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Field(field) if field.action == "opened" => Some(&field.issue),
+                _ => None,
+            })
+            .filter_map(IssueInfo::from_json)
+            .filter(|info| {
+                !info.is_pr
+                    && !linked.contains_key(&info.number)
+                    && (!info.bd_created || self.opts.adopt_bd_created)
+            })
+            .map(|info| info.number)
+            .collect()
+    }
+
+    async fn create_opened(&self, issue: &Value) -> Result<String> {
+        let number = issue["number"].as_u64().context("issue without a number")?;
+        let prefix = self
+            .bd
+            .config_get("issue_prefix")
+            .await?
+            .context("no issue_prefix configured")?;
+        let beads = self.bd.export().await?;
+        let taken: BTreeSet<String> = beads.iter().map(|b| b.id.clone()).collect();
+        let config = self.id_config().await;
+        let len = ids::adaptive_len(taken.len() + 1, &config);
+        let key = format!("{}#{number}", self.repo().to_lowercase());
+        let id = ids::short_id(&prefix, &key, len, &config, &taken);
+        let labels: Vec<&str> = issue["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l["name"].as_str())
+            .collect();
+        let only = |prefix: &str, values: &[&str]| {
+            labels
+                .iter()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .find(|v| values.contains(v))
+        };
+        let priority = only("priority::", PRIORITIES)
+            .and_then(|name| PRIORITIES.iter().position(|p| *p == name))
+            .unwrap_or(2);
+        let mut fields = vec![
+            "-t".to_string(),
+            only("type::", TYPES).unwrap_or("task").to_string(),
+            "-p".into(),
+            priority.to_string(),
+            format!(
+                "--external-ref={}",
+                issue["html_url"].as_str().unwrap_or_default()
+            ),
+        ];
+        if let Some(body) = issue["body"].as_str().filter(|b| !b.trim().is_empty()) {
+            fields.push(format!("--description={body}"));
+        }
+        if let Some(login) = issue["assignee"]["login"].as_str() {
+            fields.extend(["-a".to_string(), login.to_string()]);
+        }
+        if labels.contains(&IN_PROGRESS_LABEL) {
+            fields.extend(["-s".to_string(), "in_progress".into()]);
+        }
+        let plain: Vec<&str> = labels
+            .iter()
+            .copied()
+            .filter(|l| !l.contains("::"))
+            .collect();
+        if !plain.is_empty() {
+            fields.push(format!("--labels={}", plain.join(",")));
+        }
+        let title = issue["title"].as_str().unwrap_or("(untitled)");
+        self.bd.create(&id, title, &fields).await?;
+        let mut fresh = self.fresh_beads().await?;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        fresh.insert(id.clone(), now);
+        self.state_set("fresh", &serde_json::to_string(&fresh)?)
+            .await?;
+        Ok(id)
     }
 
     async fn apply_field_changes(
@@ -1076,12 +1619,29 @@ impl Sync<'_> {
             return Ok(applied);
         }
         let beads = self.bd.export().await?;
-        let linked = linked(&beads, self.repo());
+        let mut linked = linked(&beads, self.repo());
+        let opening = self.opening(changes, &linked);
         let tracked = self.tracked_comments().await?;
         for field in queued {
             let Some(n) = field.issue["number"].as_u64() else {
                 continue;
             };
+            if opening.contains(&n) && !linked.contains_key(&n) {
+                match self.create_opened(&field.issue).await {
+                    Ok(id) => {
+                        info!("#{n}: created {id} from the opened event");
+                        linked.insert(n, id);
+                    }
+                    Err(e) => {
+                        warn!("#{n}: could not create its bead directly; importing instead: {e:#}");
+                        if let Err(e) = self.bd.github_pull(&[n]).await {
+                            warn!("#{n}: could not import it: {e:#}");
+                        }
+                        linked = self::linked(&self.bd.export().await?, self.repo());
+                    }
+                }
+                continue;
+            }
             let Some(id) = linked.get(&n) else { continue };
             let Some(bead) = self.bd.export().await?.into_iter().find(|b| &b.id == id) else {
                 continue;
@@ -1207,6 +1767,8 @@ impl Sync<'_> {
         let linked = linked(&beads, self.repo());
         let before = self.tracked_comments().await?;
         let mut all = before.clone();
+        let texts_before = self.texts().await?;
+        let mut texts = texts_before.clone();
         for (n, action, comment) in queued {
             let Some(id) = linked.get(&n) else { continue };
             let Some(bead) = beads.iter().find(|b| &b.id == id) else {
@@ -1215,6 +1777,22 @@ impl Sync<'_> {
             let Some(cid) = comment["id"].as_u64() else {
                 continue;
             };
+            if action != CommentAction::Deleted
+                && comment["body"]
+                    .as_str()
+                    .and_then(TextField::marked)
+                    .is_some()
+            {
+                let all = self
+                    .gh
+                    .get_all(&format!(
+                        "repos/{}/issues/{n}/comments?per_page=100",
+                        self.repo()
+                    ))
+                    .await
+                    .unwrap_or_else(|_| vec![comment.clone()]);
+                self.import_marked(n, bead, &all, &mut texts).await;
+            }
             let previous = all.get(&n).cloned().unwrap_or_default();
             let mut tracked = previous.clone();
             let plan = match action {
@@ -1253,8 +1831,13 @@ impl Sync<'_> {
                 all.insert(n, tracked);
             }
         }
+        let texts_changed = texts != texts_before;
+        if texts_changed {
+            self.state_set("texts", &serde_json::to_string(&texts)?)
+                .await?;
+        }
         if all == before {
-            return Ok(false);
+            return Ok(texts_changed);
         }
         self.state_set("comments", &serde_json::to_string(&all)?)
             .await?;
@@ -1355,10 +1938,22 @@ impl Sync<'_> {
         let mut mentions = BTreeSet::new();
         let mut pulls = BTreeMap::new();
         let mut duplicates = BTreeMap::new();
+        let mut truncated = BTreeSet::new();
         for node in &nodes {
             let Some(n) = node["number"].as_u64() else {
                 continue;
             };
+            if [
+                "blockedBy",
+                "timelineItems",
+                "closedByPullRequestsReferences",
+            ]
+            .iter()
+            .any(|key| node[*key]["pageInfo"]["hasNextPage"].as_bool() == Some(true))
+            {
+                warn!("#{n}: GitHub returned only part of its links; keeping existing ones");
+                truncated.insert(n);
+            }
             if let (true, Some(m)) = (
                 own(&node["duplicateOf"]),
                 node["duplicateOf"]["number"].as_u64(),
@@ -1409,6 +2004,7 @@ impl Sync<'_> {
             mentions,
             pulls,
             duplicates,
+            truncated,
         })
     }
 
@@ -1436,6 +2032,7 @@ impl Sync<'_> {
             mentions,
             pulls,
             duplicates,
+            truncated,
         } = match self.github_relations(scope.as_ref()).await {
             Ok(found) => found,
             Err(e) => {
@@ -1458,7 +2055,7 @@ impl Sync<'_> {
             .collect();
         let recorded = self.recorded_relations().await?;
         let base: BTreeSet<String> = recorded.iter().filter(in_scope).cloned().collect();
-        let plan = plan_relations(&remote, &base, &have, &linked);
+        let plan = plan_relations(&remote, &base, &have, &linked, &truncated);
 
         let ids = |edge: &str| edge_beads(edge, &linked).expect("planned edges are linked");
         let mut next_base: BTreeSet<String> = recorded
@@ -1727,9 +2324,6 @@ impl Sync<'_> {
 
     async fn nest_fresh(&self) -> Result<()> {
         let mut fresh = self.fresh_beads().await?;
-        if fresh.is_empty() {
-            return Ok(());
-        }
         let before = fresh.clone();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1749,11 +2343,24 @@ impl Sync<'_> {
                     .map(|d| d.depends_on_id.clone())
             };
             let nested = |id: &str, parent: &str| id.starts_with(&format!("{parent}."));
-            let next = fresh.keys().find_map(|id| {
-                let parent = parent_of(id)?;
-                let waiting = fresh.contains_key(&parent)
+            let imported: BTreeSet<&str> = beads
+                .iter()
+                .filter(|b| {
+                    b.external_ref
+                        .as_deref()
+                        .and_then(|r| issue_number(r, self.repo()))
+                        .is_some()
+                        && ids::auto_shaped(&b.id)
+                })
+                .map(|b| b.id.as_str())
+                .collect();
+            let candidate = |id: &str| fresh.contains_key(id) || imported.contains(id);
+            let next = taken.iter().find_map(|id| {
+                let parent = parent_of(id).filter(|_| candidate(id))?;
+                let waiting = candidate(&parent)
                     && parent_of(&parent).is_some_and(|grand| !nested(&parent, &grand));
-                (!nested(id, &parent) && !waiting).then(|| (id.clone(), parent))
+                (!nested(id, &parent) && !waiting && !nested(&parent, id))
+                    .then(|| (id.clone(), parent))
             });
             let Some((id, parent)) = next else {
                 break;
@@ -1822,13 +2429,17 @@ impl Sync<'_> {
                     stale.len()
                 );
             }
-            let mut numbers: BTreeSet<u64> = issues.into_iter().collect();
+            let opening = self.opening(&fresh, &linked);
+            let mut numbers: BTreeSet<u64> = issues
+                .into_iter()
+                .filter(|n| !opening.contains(n))
+                .collect();
             numbers.extend(stale.iter().flat_map(Change::issues));
             numbers.extend(
                 fresh
                     .iter()
                     .flat_map(Change::issues)
-                    .filter(|n| !linked.contains_key(n)),
+                    .filter(|n| !linked.contains_key(n) && !opening.contains(n)),
             );
             self.mode = Mode::Issues(numbers.into_iter().collect());
             changes = fresh;
@@ -1880,7 +2491,7 @@ impl Sync<'_> {
             || comments_changed
             || applied
             || self.bd.export_raw().await? != before;
-        if changed && !matches!(self.mode, Mode::Issues(_)) {
+        if (changed || self.transport == Transport::Dolt) && !matches!(self.mode, Mode::Issues(_)) {
             self.state_set("since", &self.next_since).await?;
         }
         Ok(changed)

@@ -3,6 +3,9 @@
 sync.example.com {
 	@sync path /webhook /healthz
 	handle @sync {
+		request_body {
+			max_size 1MB
+		}
 		reverse_proxy 127.0.0.1:8787
 	}
 	handle {

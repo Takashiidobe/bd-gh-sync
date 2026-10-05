@@ -85,6 +85,9 @@ pub struct Bead {
     pub id: String,
     pub title: Value,
     pub description: Option<String>,
+    pub design: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub notes: Option<String>,
     pub status: Value,
     pub close_reason: Option<String>,
     pub priority: Value,
@@ -283,7 +286,17 @@ impl<'a> Bd<'a> {
     }
 
     pub async fn dolt_pull(&self) -> Result<()> {
-        self.run(&["dolt", "pull"]).await.map(drop)
+        self.run(&["dolt", "pull"]).await.map(drop).map_err(|e| {
+            if format!("{e:#}").contains("merge conflicts") {
+                e.context(
+                    "both sides edited the same bead (for example a local edit raced a rename); \
+                     resolve it by hand: `bd dolt pull --strategy theirs` keeps GitHub-side data and drops \
+                     the local edit, `--strategy ours` keeps the local edit but can duplicate a renamed bead",
+                )
+            } else {
+                e
+            }
+        })
     }
 
     pub async fn dolt_push(&self) -> Result<()> {
@@ -343,6 +356,20 @@ impl<'a> Bd<'a> {
     pub async fn update_fields(&self, id: &str, fields: &[String]) -> Result<()> {
         let mut args = vec!["update".to_string(), id.to_string()];
         args.extend(fields.iter().cloned());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(&refs).await.map(drop)
+    }
+
+    pub async fn set_text(&self, id: &str, flag: &str, text: &str) -> Result<()> {
+        self.run(&["update", id, &format!("{flag}={text}")])
+            .await
+            .map(drop)
+    }
+
+    pub async fn create(&self, id: &str, title: &str, fields: &[String]) -> Result<()> {
+        let mut args = vec!["create".to_string(), "--id".into(), id.into()];
+        args.extend(fields.iter().cloned());
+        args.extend(["--silent".to_string(), "--".into(), title.into()]);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.run(&refs).await.map(drop)
     }

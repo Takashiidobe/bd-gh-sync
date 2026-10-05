@@ -78,6 +78,21 @@ pub fn imported_prefix(id: &str) -> Option<&str> {
         .then_some(prefix)
 }
 
+pub fn auto_shaped(id: &str) -> bool {
+    let (root, children) = id.split_once('.').unwrap_or((id, ""));
+    let Some((prefix, hash)) = root.rsplit_once('-') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && (3..=8).contains(&hash.len())
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        && children
+            .split('.')
+            .all(|part| part.is_empty() || part.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub fn next_child(parent: &str, ids: &BTreeSet<String>) -> String {
     let last = ids
         .iter()

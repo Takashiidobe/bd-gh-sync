@@ -22,9 +22,18 @@ pub fn verify(secret: &[u8], body: &[u8], header: Option<&str>) -> bool {
 pub enum Event {
     Ping,
     Projects,
-    Sync { repo: String, issues: BTreeSet<u64> },
-    Changes { repo: String, changes: Vec<Change> },
-    Reconcile { repo: String },
+    Sync {
+        repo: String,
+        issues: BTreeSet<u64>,
+    },
+    Changes {
+        repo: String,
+        changes: Vec<Change>,
+    },
+    Pulls {
+        repo: String,
+        numbers: BTreeSet<u64>,
+    },
     Ignored(String),
 }
 
@@ -39,8 +48,12 @@ pub fn parse(event: &str, payload: &Value) -> Event {
         return Event::Ignored("no repository in payload".into());
     };
     if event == "pull_request" {
-        return Event::Reconcile {
-            repo: repo.to_string(),
+        return match payload["pull_request"]["number"].as_u64() {
+            Some(number) => Event::Pulls {
+                repo: repo.to_string(),
+                numbers: BTreeSet::from([number]),
+            },
+            None => Event::Ignored("no pull request in payload".into()),
         };
     }
     let keys: &[&str] = match event {
@@ -120,7 +133,14 @@ fn change_of(
         "issues" => {
             if !matches!(
                 action,
-                "edited" | "labeled" | "unlabeled" | "assigned" | "unassigned" | "closed" | "reopened"
+                "opened"
+                    | "edited"
+                    | "labeled"
+                    | "unlabeled"
+                    | "assigned"
+                    | "unassigned"
+                    | "closed"
+                    | "reopened"
             ) || !payload["issue"]["pull_request"].is_null()
             {
                 return None;

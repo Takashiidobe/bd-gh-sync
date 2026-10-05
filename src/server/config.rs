@@ -130,3 +130,34 @@ impl Secrets {
         })
     }
 }
+
+fn secret_path(data_dir: &Path, repo: &str) -> PathBuf {
+    data_dir
+        .join(".secrets")
+        .join(repo.to_lowercase().replace('/', "__"))
+}
+
+pub fn repo_secret(data_dir: &Path, repo: &str) -> Option<String> {
+    crate::server::project::validate_repo(repo).ok()?;
+    let text = std::fs::read_to_string(secret_path(data_dir, repo)).ok()?;
+    let secret = text.trim();
+    (!secret.is_empty()).then(|| secret.to_string())
+}
+
+pub fn ensure_repo_secret(data_dir: &Path, repo: &str) -> Result<String> {
+    if let Some(secret) = repo_secret(data_dir, repo) {
+        return Ok(secret);
+    }
+    let mut bytes = [0u8; 32];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut bytes)?;
+    let secret = hex::encode(bytes);
+    let path = secret_path(data_dir, repo);
+    let dir = path.parent().context("secret path has a parent")?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create_new(true);
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    std::io::Write::write_all(&mut file.open(&path)?, secret.as_bytes())?;
+    Ok(secret)
+}
