@@ -572,10 +572,6 @@ impl Watcher {
                 outcome = Outcome::Failed;
                 continue;
             }
-            if issue.body["state"] != "closed" {
-                revert(&mut current);
-                continue;
-            }
             if let Some((_, target)) = want.split_once(':') {
                 match self
                     .mark_duplicate(&issue.body, &links[target], target, &id)
@@ -591,7 +587,9 @@ impl Watcher {
                 }
                 continue;
             }
-            if issue.body["state_reason"].as_str().unwrap_or("completed") == want {
+            if issue.body["state"] == "closed"
+                && issue.body["state_reason"].as_str().unwrap_or("completed") == want
+            {
                 continue;
             }
             let resp = self
