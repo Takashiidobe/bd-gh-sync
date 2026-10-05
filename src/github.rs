@@ -1,6 +1,16 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, Method, RequestBuilder, header::LINK};
+use reqwest::{
+    Client, Method, RequestBuilder,
+    header::{HeaderMap, LINK},
+};
 use serde_json::{Value, json};
+use tracing::warn;
 
 pub const WEBHOOK_EVENTS: &[&str] = &[
     "issues",
@@ -13,10 +23,26 @@ pub const WEBHOOK_EVENTS: &[&str] = &[
 
 pub const DEFAULT_API_URL: &str = "https://api.github.com";
 
+const WRITE_SPACING: Duration = Duration::from_secs(1);
+const MAX_WAIT: Duration = Duration::from_secs(300);
+const MAX_RETRIES: u32 = 3;
+const DEFAULT_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct Gate {
+    last_write: Option<Instant>,
+    blocked_until: Option<Instant>,
+}
+
+type SharedGate = Arc<tokio::sync::Mutex<Gate>>;
+
+static GATES: LazyLock<Mutex<HashMap<String, SharedGate>>> = LazyLock::new(Mutex::default);
+
 pub struct GitHub {
     client: Client,
     api: String,
     token: String,
+    gate: SharedGate,
 }
 
 pub struct Response {
@@ -36,10 +62,70 @@ impl Response {
 
 impl GitHub {
     pub fn new(api: &str, token: &str) -> Self {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .entry(format!("{api} {token}"))
+            .or_default()
+            .clone();
         Self {
             client: Client::new(),
             api: api.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            gate,
+        }
+    }
+
+    pub fn paused_for(&self) -> Option<Duration> {
+        let gate = self.gate.try_lock().ok()?;
+        let remaining = gate.blocked_until?.checked_duration_since(Instant::now())?;
+        (remaining > MAX_WAIT).then_some(remaining)
+    }
+
+    pub async fn pause(&self, wait: Duration) {
+        let mut gate = self.gate.lock().await;
+        let until = Instant::now() + wait;
+        gate.blocked_until = Some(gate.blocked_until.map_or(until, |b| b.max(until)));
+    }
+
+    async fn dispatch(
+        &self,
+        build: impl Fn() -> RequestBuilder,
+        write: bool,
+    ) -> Result<Sent> {
+        let mut attempt = 0;
+        loop {
+            {
+                let mut gate = self.gate.lock().await;
+                let now = Instant::now();
+                if let Some(remaining) = gate.blocked_until.and_then(|b| b.checked_duration_since(now))
+                {
+                    if remaining > MAX_WAIT {
+                        return Ok(Sent::Paused(remaining));
+                    }
+                    tokio::time::sleep(remaining).await;
+                }
+                if write {
+                    if let Some(last) = gate.last_write {
+                        tokio::time::sleep(WRITE_SPACING.saturating_sub(last.elapsed())).await;
+                    }
+                    gate.last_write = Some(Instant::now());
+                }
+            }
+            let resp = build().send().await?;
+            let Some(wait) = rate_limit_wait(resp.status().as_u16(), resp.headers()) else {
+                return Ok(Sent::Done(resp));
+            };
+            warn!(
+                "GitHub rate limit (HTTP {}); waiting {}s before retrying",
+                resp.status(),
+                wait.as_secs()
+            );
+            self.pause(wait).await;
+            attempt += 1;
+            if wait > MAX_WAIT || attempt > MAX_RETRIES {
+                return Ok(Sent::Done(resp));
+            }
         }
     }
 
@@ -76,14 +162,24 @@ impl GitHub {
     }
 
     pub async fn send(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Response> {
-        let mut req = self.request(method.clone(), &self.url(path));
-        if let Some(body) = body {
-            req = req.json(body);
-        }
-        let resp = req
-            .send()
+        let url = self.url(path);
+        let write = method != Method::GET;
+        let sent = self
+            .dispatch(
+                || {
+                    let req = self.request(method.clone(), &url);
+                    match body {
+                        Some(body) => req.json(body),
+                        None => req,
+                    }
+                },
+                write,
+            )
             .await
             .with_context(|| format!("{method} {path}"))?;
+        let Sent::Done(resp) = sent else {
+            return Ok(paused(&sent));
+        };
         let status = resp.status().as_u16();
         let text = resp.text().await?;
         let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
@@ -102,11 +198,13 @@ impl GitHub {
         let mut items = Vec::new();
         let mut next = Some(self.url(path));
         while let Some(url) = next.take() {
-            let resp = self
-                .request(Method::GET, &url)
-                .send()
+            let sent = self
+                .dispatch(|| self.request(Method::GET, &url), false)
                 .await
                 .with_context(|| format!("GET {url}"))?;
+            let Sent::Done(resp) = sent else {
+                bail!("GET {url}: {}", paused(&sent).body["message"]);
+            };
             let status = resp.status();
             next = resp
                 .headers()
@@ -126,12 +224,16 @@ impl GitHub {
     }
 
     pub async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        let resp = self
-            .request(Method::POST, &self.graphql_url())
-            .json(&json!({"query": query, "variables": variables}))
-            .send()
+        let url = self.graphql_url();
+        let payload = json!({"query": query, "variables": variables});
+        let write = query.trim_start().starts_with("mutation");
+        let sent = self
+            .dispatch(|| self.request(Method::POST, &url).json(&payload), write)
             .await
             .context("GraphQL request")?;
+        let Sent::Done(resp) = sent else {
+            bail!("GraphQL: {}", paused(&sent).body["message"]);
+        };
         let status = resp.status();
         let body: Value = resp.json().await.context("GraphQL response")?;
         if !status.is_success() || body.get("errors").is_some_and(|e| !e.is_null()) {
@@ -166,6 +268,46 @@ impl GitHub {
             cursor = connection["pageInfo"]["endCursor"].clone();
         }
     }
+}
+
+enum Sent {
+    Done(reqwest::Response),
+    Paused(Duration),
+}
+
+fn paused(sent: &Sent) -> Response {
+    let wait = match sent {
+        Sent::Paused(wait) => wait.as_secs(),
+        Sent::Done(_) => 0,
+    };
+    Response {
+        status: 429,
+        body: json!({"message": format!("GitHub rate limit; paused for another {wait}s")}),
+    }
+}
+
+fn rate_limit_wait(status: u16, headers: &HeaderMap) -> Option<Duration> {
+    if status != 403 && status != 429 {
+        return None;
+    }
+    let number = |name: &str| {
+        headers
+            .get(name)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    if let Some(secs) = number("retry-after") {
+        return Some(Duration::from_secs(secs.max(1)));
+    }
+    if number("x-ratelimit-remaining") == Some(0) {
+        let reset = UNIX_EPOCH + Duration::from_secs(number("x-ratelimit-reset")?);
+        let wait = reset.duration_since(SystemTime::now()).unwrap_or_default();
+        return Some(wait + Duration::from_secs(1));
+    }
+    (status == 429).then_some(DEFAULT_BACKOFF)
 }
 
 fn next_link(header: &str) -> Option<String> {

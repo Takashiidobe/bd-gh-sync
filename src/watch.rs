@@ -78,6 +78,10 @@ pub fn issue_path(external_ref: &str) -> Option<String> {
     }
 }
 
+const PUSH_BATCH: usize = 10;
+const PUSH_PAUSE: Duration = Duration::from_secs(10);
+const PUSH_BACKOFF: Duration = Duration::from_secs(120);
+
 fn links(beads: &[Bead]) -> BTreeMap<String, String> {
     beads
         .iter()
@@ -247,6 +251,9 @@ impl Watcher {
         };
         self.migrate_renames(&beads);
         let fields = self.step("fields", self.push_fields(&beads).await);
+        if self.rate_limited() {
+            return Outcome::Failed;
+        }
         if fields == Outcome::Pushed && !self.opts.dry_run {
             match self.export().await {
                 Some(fresh) => beads = fresh,
@@ -264,6 +271,17 @@ impl Watcher {
             .merge(close_reasons)
             .merge(comments)
             .merge(relations)
+    }
+
+    fn rate_limited(&self) -> bool {
+        let Some(wait) = self.gh.paused_for() else {
+            return false;
+        };
+        warn!(
+            "GitHub rate limit; pausing pushes for another {}",
+            humantime::format_duration(Duration::from_secs(wait.as_secs()))
+        );
+        true
     }
 
     fn step(&self, name: &str, result: Result<Outcome>) -> Outcome {
@@ -369,27 +387,46 @@ impl Watcher {
         }
 
         info!("pushing {} bead(s): {}", changed.len(), changed.join(" "));
-        let out = self.bd().github_push(&changed).await?;
-        if !out.combined().is_empty() {
-            eprintln!("{}", out.combined());
+        let mut outcome = Outcome::Pushed;
+        let mut pushed_any = false;
+        for (n, chunk) in changed.chunks(PUSH_BATCH).enumerate() {
+            if n > 0 {
+                tokio::time::sleep(PUSH_PAUSE).await;
+            }
+            if self.rate_limited() {
+                outcome = Outcome::Failed;
+                break;
+            }
+            let out = self.bd().github_push(chunk).await?;
+            if !out.combined().is_empty() {
+                eprintln!("{}", out.combined());
+            }
+            let lower = out.combined().to_lowercase();
+            if lower.contains("rate limit") {
+                self.gh.pause(PUSH_BACKOFF).await;
+            }
+            if !out.success {
+                warn!("push failed; will retry");
+                outcome = Outcome::Failed;
+                break;
+            }
+            if ["failed to create", "failed to update", "failed to push"]
+                .iter()
+                .any(|s| lower.contains(s))
+            {
+                warn!("push reported per-issue failures; will retry those beads");
+                outcome = Outcome::Failed;
+                break;
+            }
+            for id in chunk {
+                kept.insert(id.clone(), current[id].clone());
+            }
+            self.save("pushed.json", &kept)?;
+            pushed_any = true;
         }
-        if !out.success {
-            warn!("push failed; will retry");
-            return Ok(Outcome::Failed);
+        if !pushed_any {
+            return Ok(outcome);
         }
-        let lower = out.combined().to_lowercase();
-        if ["failed to create", "failed to update", "failed to push"]
-            .iter()
-            .any(|s| lower.contains(s))
-        {
-            warn!("push reported per-issue failures; will retry those beads");
-            return Ok(Outcome::Failed);
-        }
-        for id in changed {
-            let fp = current[&id].clone();
-            kept.insert(id, fp);
-        }
-        self.save("pushed.json", &kept)?;
 
         if let Err(e) = self
             .bd()
@@ -404,7 +441,7 @@ impl Watcher {
                 Err(e) => warn!("bd dolt push failed; will retry after the next change: {e:#}"),
             }
         }
-        Ok(Outcome::Pushed)
+        Ok(outcome)
     }
 
     async fn push_assignees(&self, beads: &[Bead]) -> Result<Outcome> {
@@ -779,6 +816,10 @@ impl Watcher {
             if handled.iter().any(|h| h == id) {
                 continue;
             }
+            if self.rate_limited() {
+                outcome = Outcome::Failed;
+                break;
+            }
             if self.opts.dry_run {
                 info!("would post comment {id} of {bead}");
                 outcome.pushed();
@@ -824,6 +865,9 @@ impl Watcher {
                 }
             }
             handled.push(id.to_string());
+            if !self.opts.dry_run {
+                self.save(file, &handled)?;
+            }
         }
         handled.retain(|h| current.iter().any(|c| c.0 == h));
         self.save(file, &handled)?;
