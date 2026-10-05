@@ -8,3 +8,6 @@
 
 # Rust build output
 /target/
+
+# Local deploy/test notes
+/test-deploy/
