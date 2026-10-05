@@ -368,6 +368,10 @@ impl<'a> Bd<'a> {
         bail!("bd show {id} failed:\n{}", out.combined())
     }
 
+    pub async fn rename(&self, old: &str, new: &str) -> Result<()> {
+        self.run(&["rename", old, new]).await.map(drop)
+    }
+
     pub async fn dep_add(&self, from: &str, to: &str, kind: &str) -> Result<()> {
         self.run(&["dep", "add", from, to, "-t", kind])
             .await

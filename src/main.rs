@@ -1,5 +1,6 @@
 mod bd;
 mod github;
+mod ids;
 mod server;
 mod sync;
 mod watch;

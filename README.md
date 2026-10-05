@@ -5,18 +5,18 @@ Real-time, two-way sync between [beads](https://github.com/gastownhall/beads)
 
 ## What syncs
 
-| GitHub | beads |
-|---|---|
-| title, body, open/closed | title, description, status |
-| labels | labels, priority, type, status |
-| first assignee | assignee |
-| close reason (`completed`, `not_planned`, `duplicate`) | close reason |
-| closed as duplicate of #N | closed bead that `supersedes` #N's bead |
-| comments | comments |
-| sub-issue of #N | `parent-child` dependency |
-| blocked by #N | `blocks` dependency |
-| `Ref: #N` mention (GitHub → beads only) | `related` dependency |
-| open PR that closes the issue (GitHub → beads only) | bead goes `in_progress` |
+| GitHub                                                 | beads                                   |
+| ------------------------------------------------------ | --------------------------------------- |
+| title, body, open/closed                               | title, description, status              |
+| labels                                                 | labels, priority, type, status          |
+| first assignee                                         | assignee                                |
+| close reason (`completed`, `not_planned`, `duplicate`) | close reason                            |
+| closed as duplicate of #N                              | closed bead that `supersedes` #N's bead |
+| comments                                               | comments                                |
+| sub-issue of #N                                        | `parent-child` dependency               |
+| blocked by #N                                          | `blocks` dependency                     |
+| `Ref: #N` mention (GitHub → beads only)                | `related` dependency                    |
+| open PR that closes the issue (GitHub → beads only)    | bead goes `in_progress`                 |
 
 Optionally, GitHub Projects v2 fields (status, priority, estimate, iteration)
 sync too; see [`deploy/config.toml`](deploy/config.toml).
@@ -74,3 +74,22 @@ bd-gh-sync watch --dolt-sync 30
 ```
 
 `--dolt-sync 30` also pulls what the server or Action synced from GitHub.
+
+`watch` follows `.beads/` with inotify (FSEvents on macOS) and pushes within a
+second of a change. To keep it running for a repo, run this inside that clone
+(`$BDGH` is a checkout of this repo, for the files in
+[`deploy/watch`](deploy/watch)):
+
+```sh
+# Linux: systemd user service
+mkdir -p ~/.config/systemd/user && cp $BDGH/deploy/watch/bd-gh-sync-watch@.service ~/.config/systemd/user/
+systemctl --user enable --now "bd-gh-sync-watch@$(systemd-escape --path "$PWD").service"
+
+# macOS: launchd
+n=$(basename "$PWD"); p=~/Library/LaunchAgents/bd-gh-sync.$n.plist
+sed "s#@REPO@#$PWD#g; s#@HOME@#$HOME#g; s#@NAME@#$n#g" $BDGH/deploy/watch/bd-gh-sync-watch.plist > "$p"
+launchctl load "$p"
+```
+
+Put `GITHUB_TOKEN=...` in `~/.config/bd-gh-sync/env` for systemd; on macOS use
+`gh auth login`.
