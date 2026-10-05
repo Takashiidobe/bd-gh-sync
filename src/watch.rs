@@ -197,11 +197,7 @@ pub async fn run(opts: Options) -> Result<()> {
     };
     let api = std::env::var("GITHUB_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into());
 
-    let state_dir = match wd.output("git", &["rev-parse", "--absolute-git-dir"]).await {
-        Ok(out) if out.success => PathBuf::from(out.stdout.trim()).join("bd-gh-sync"),
-        _ => beads_dir.join("bd-gh-sync.local"),
-    };
-    std::fs::create_dir_all(&state_dir)?;
+    let state_dir = state_dir(&wd, &beads_dir).await?;
     let lock = File::create(state_dir.join("watch.lock"))?;
     if lock.try_lock().is_err() {
         bail!(
@@ -226,6 +222,41 @@ pub async fn run(opts: Options) -> Result<()> {
         result = watcher.watch(&beads_dir) => result,
         _ = crate::server::shutdown() => Ok(()),
     }
+}
+
+async fn state_dir(wd: &Workdir, beads_dir: &Path) -> Result<PathBuf> {
+    let dir = match wd.output("git", &["rev-parse", "--absolute-git-dir"]).await {
+        Ok(out) if out.success => PathBuf::from(out.stdout.trim()).join("bd-gh-sync"),
+        _ => beads_dir.join("bd-gh-sync.local"),
+    };
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub async fn push_beads(wd: Workdir, gh: GitHub) -> Result<()> {
+    let state_dir = state_dir(&wd, &wd.dir.join(".beads")).await?;
+    let watcher = Watcher {
+        wd,
+        gh,
+        state_dir,
+        opts: Options {
+            once: true,
+            initial_push: false,
+            poll: Duration::ZERO,
+            debounce: Duration::ZERO,
+            backend: Backend::Poll,
+            dolt_sync: Duration::ZERO,
+            dry_run: false,
+        },
+    };
+    let mut outcome = watcher.sync_pass().await;
+    if outcome == Outcome::Pushed {
+        outcome = watcher.sync_pass().await;
+    }
+    if outcome == Outcome::Failed {
+        bail!("some changes could not be pushed to GitHub");
+    }
+    Ok(())
 }
 
 async fn gh_auth_token(wd: &Workdir) -> Option<String> {

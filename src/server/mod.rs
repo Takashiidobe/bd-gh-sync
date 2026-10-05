@@ -40,6 +40,13 @@ pub async fn sync(config: Config, repo: &str, mode: Mode) -> Result<()> {
     project.sync(&config, &secrets, mode).await
 }
 
+pub async fn push(config: Config, repo: &str) -> Result<()> {
+    let secrets = Secrets::from_env()?;
+    let project = Project::find(&config.data_dir, repo)?
+        .with_context(|| format!("{repo} is not a project here; run `server add` first"))?;
+    project.push(&config, &secrets).await
+}
+
 pub async fn add(config: Config, repo: &str, no_webhook: bool) -> Result<()> {
     let secrets = Secrets::from_env()?;
     require_projects_token(&config, &secrets)?;

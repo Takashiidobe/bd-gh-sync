@@ -4,10 +4,11 @@ use anyhow::{Context, Result, bail};
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::{
-    bd::Workdir,
+    bd::{Bd, Workdir},
     github::GitHub,
     server::config::{Config, Secrets},
     sync::{self, Mode, Options},
+    watch,
 };
 
 #[derive(Debug, Clone)]
@@ -123,6 +124,17 @@ impl Project {
             .run("git", &["clone", "-q", &url, &self.dir.to_string_lossy()])
             .await
             .map(drop)
+    }
+
+    pub async fn push(&self, config: &Config, secrets: &Secrets) -> Result<()> {
+        let span = info_span!("push", project = %self.repo);
+        async {
+            let wd = self.workdir(&self.dir, config, secrets);
+            Bd::new(&wd).dolt_pull().await?;
+            watch::push_beads(wd, GitHub::new(&config.api_url, &secrets.token)).await
+        }
+        .instrument(span)
+        .await
     }
 
     pub async fn sync(&self, config: &Config, secrets: &Secrets, mode: Mode) -> Result<()> {

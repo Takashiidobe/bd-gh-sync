@@ -168,6 +168,11 @@ enum ServerCommand {
         #[arg(long, conflicts_with = "issues", help = "Reconcile every issue")]
         all: bool,
     },
+    #[command(about = "Pull the project's beads and push them to GitHub now")]
+    Push {
+        #[arg(help = "owner/name")]
+        repo: String,
+    },
     #[command(about = "List the projects being synced")]
     List,
 }
@@ -245,6 +250,7 @@ async fn main() -> Result<()> {
                 ServerCommand::Sync { repo, issues, all } => {
                     server::sync(config, &repo, mode(issues, false, all)).await
                 }
+                ServerCommand::Push { repo } => server::push(config, &repo).await,
                 ServerCommand::List => server::list(&config),
             }
         }
