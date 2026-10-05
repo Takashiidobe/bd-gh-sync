@@ -236,6 +236,7 @@ async fn main() -> Result<()> {
                 debounce: Duration::from_secs_f64(args.debounce),
                 backend: args.backend,
                 dolt_sync: Duration::from_secs(args.dolt_sync),
+                publish: args.dolt_sync != 0,
                 dry_run: args.dry_run,
             })
             .await

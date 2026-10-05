@@ -35,6 +35,7 @@ pub struct Options {
     pub debounce: Duration,
     pub backend: Backend,
     pub dolt_sync: Duration,
+    pub publish: bool,
     pub dry_run: bool,
 }
 
@@ -246,6 +247,7 @@ pub async fn push_beads(wd: Workdir, gh: GitHub) -> Result<()> {
             debounce: Duration::ZERO,
             backend: Backend::Poll,
             dolt_sync: Duration::ZERO,
+            publish: true,
             dry_run: false,
         },
     };
@@ -527,13 +529,27 @@ impl Watcher {
         {
             warn!("could not commit issue links to Dolt: {e:#}");
         }
-        if !self.opts.dolt_sync.is_zero() {
-            match self.bd().dolt_push().await {
-                Ok(()) => info!("pushed beads to the Dolt remote"),
-                Err(e) => warn!("bd dolt push failed; will retry after the next change: {e:#}"),
-            }
+        if self.opts.publish {
+            self.publish_links().await;
         }
         Ok(outcome)
+    }
+
+    async fn publish_links(&self) {
+        for attempt in 1..=3 {
+            match self.bd().dolt_push().await {
+                Ok(()) => {
+                    info!("pushed beads to the Dolt remote");
+                    return;
+                }
+                Err(e) => warn!("bd dolt push failed (attempt {attempt}): {e:#}"),
+            }
+            if let Err(e) = self.bd().dolt_pull().await {
+                warn!("bd dolt pull failed: {e:#}");
+                return;
+            }
+        }
+        warn!("could not push beads to the Dolt remote; will retry after the next change");
     }
 
     async fn push_assignees(&self, beads: &[Bead]) -> Result<Outcome> {
