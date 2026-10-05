@@ -64,18 +64,33 @@ into your repository and change `uses: ./` to `uses: Takashiidobe/bd-gh-sync@mai
 
 ### 3. beads → GitHub
 
-On each machine where you edit beads:
+The server is the only thing that writes to GitHub, so no machine needs a
+GitHub token. On each machine where you edit beads, `watch` pushes your commits
+to the Dolt remote (`refs/dolt/data`) and pulls what the server synced back:
 
 ```sh
 scripts/install-bd-gh-sync.sh                # or: cargo install --git https://github.com/Takashiidobe/bd-gh-sync
 bd config set github.repository owner/repo
-export GITHUB_TOKEN=...                      # or `gh auth login`
-bd-gh-sync watch --dolt-sync 30
+bd-gh-sync watch
 ```
 
-`--dolt-sync 30` also pulls what the server or Action synced from GitHub.
+The server checks `refs/dolt/data` every `dolt_poll_seconds` (10 by default)
+and pushes whatever changed to GitHub, creating issues for new beads and
+pushing the links back. Edits reach GitHub within about 10 seconds. To skip the
+wait, give `watch` the repository's webhook secret (from
+`<data_dir>/.secrets/<owner>__<name>` on the server) and the server's URL, and it
+nudges the server after each push:
 
-`watch` follows `.beads/` with inotify (FSEvents on macOS) and pushes within a
+```sh
+export BD_GH_SYNC_POKE_URL=https://sync.example.com/poke
+export BD_GH_SYNC_POKE_SECRET=...
+```
+
+The server's token needs Contents: read and write, because it pushes
+`refs/dolt/data` as well as reading it. `bd-gh-sync watch --local` keeps the old
+behaviour of pushing to GitHub from this machine; it needs `GITHUB_TOKEN`.
+
+`watch` follows `.beads/` with inotify (FSEvents on macOS) and reacts within a
 second of a change. To keep it running for a repo, run this inside that clone
 (`$BDGH` is a checkout of this repo, for the files in
 [`deploy/watch`](deploy/watch)):
@@ -91,5 +106,4 @@ sed "s#@REPO@#$PWD#g; s#@HOME@#$HOME#g; s#@NAME@#$n#g" $BDGH/deploy/watch/bd-gh-
 launchctl load "$p"
 ```
 
-Put `GITHUB_TOKEN=...` in `~/.config/bd-gh-sync/env` for systemd; on macOS use
-`gh auth login`.
+Put `BD_GH_SYNC_POKE_*` in `~/.config/bd-gh-sync/env` for systemd if you use them.
