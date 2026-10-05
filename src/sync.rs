@@ -44,12 +44,141 @@ pub enum Change {
         edge: String,
         added: bool,
     },
+    Field(FieldChange),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldChange {
+    pub action: String,
+    pub label: Option<String>,
+    pub changed: Vec<String>,
+    pub sender: Option<String>,
+    pub issue: Value,
+}
+
+const TYPES: &[&str] = &[
+    "bug",
+    "feature",
+    "task",
+    "epic",
+    "chore",
+    "decision",
+    "spike",
+    "story",
+    "milestone",
+];
+const PRIORITIES: &[&str] = &["critical", "high", "medium", "low", "backlog"];
+const IN_PROGRESS_LABEL: &str = "status::in_progress";
+
+pub fn known_label(label: &str) -> bool {
+    match label.split_once("::") {
+        Some(("type", value)) => TYPES.contains(&value),
+        Some(("priority", value)) => PRIORITIES.contains(&value),
+        Some(("status", _)) => label == IN_PROGRESS_LABEL,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct FieldPlan {
+    pub update: Vec<String>,
+    pub reopen: bool,
+    pub close: Option<&'static str>,
+}
+
+pub fn plan_fields(bead: &Bead, change: &FieldChange) -> FieldPlan {
+    let issue = &change.issue;
+    let labels: Vec<&str> = issue["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["name"].as_str())
+        .collect();
+    let only = |prefix: &str, values: &[&str]| {
+        let mut found = labels
+            .iter()
+            .filter_map(|l| l.strip_prefix(prefix))
+            .filter(|v| values.contains(v));
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    };
+    let mut plan = FieldPlan::default();
+    let mut update = Vec::new();
+    let mut set = |flag: &str, value: &str| {
+        update.push(flag.to_string());
+        update.push(value.to_string());
+    };
+    let changed = |key: &str| change.changed.iter().any(|c| c == key);
+    match change.action.as_str() {
+        "edited" => {
+            if let Some(title) = issue["title"].as_str().filter(|_| changed("title"))
+                && bead.title.as_str() != Some(title)
+            {
+                set("--title", title);
+            }
+            if changed("body") {
+                let body = issue["body"].as_str().unwrap_or_default();
+                if normalize(body) != normalize(bead.description.as_deref().unwrap_or_default()) {
+                    set("-d", body);
+                }
+            }
+        }
+        "assigned" | "unassigned" => {
+            let login = issue["assignee"]["login"].as_str().unwrap_or_default();
+            if login != bead.assignee.as_deref().unwrap_or_default() {
+                set("-a", login);
+            }
+        }
+        "labeled" | "unlabeled" => match change.label.as_deref().and_then(|l| l.split_once("::")) {
+            Some(("type", _)) => {
+                if let Some(kind) = only("type::", TYPES)
+                    && bead.issue_type.as_str() != Some(kind)
+                {
+                    set("-t", kind);
+                }
+            }
+            Some(("priority", _)) => {
+                if let Some(rank) = only("priority::", PRIORITIES)
+                    .and_then(|name| PRIORITIES.iter().position(|p| *p == name))
+                    && bead.priority.as_u64() != Some(rank as u64)
+                {
+                    set("-p", &rank.to_string());
+                }
+            }
+            Some(("status", _)) if issue["state"] == "open" => {
+                let wanted = if labels.contains(&IN_PROGRESS_LABEL) {
+                    "in_progress"
+                } else {
+                    "open"
+                };
+                let current = bead.status.as_str().unwrap_or_default();
+                if matches!(current, "open" | "in_progress") && current != wanted {
+                    set("-s", wanted);
+                }
+            }
+            _ => {}
+        },
+        "closed" if !bead.is_closed() => {
+            let reason = issue["state_reason"].as_str().unwrap_or("completed");
+            plan.close = Some(close_reason_for(reason).unwrap_or("Closed"));
+        }
+        "reopened" if bead.is_closed() => {
+            plan.reopen = true;
+            if labels.contains(&IN_PROGRESS_LABEL) {
+                set("-s", "in_progress");
+            }
+        }
+        _ => {}
+    }
+    plan.update = update;
+    plan
 }
 
 impl Change {
     fn issues(&self) -> Vec<u64> {
         match self {
             Change::Comment { issue, .. } => vec![*issue],
+            Change::Field(change) => change.issue["number"].as_u64().into_iter().collect(),
             Change::Relation { edge, .. } => edge_numbers(edge).into_iter().collect(),
         }
     }
@@ -159,6 +288,7 @@ struct GithubLinks {
     duplicates: BTreeMap<u64, u64>,
 }
 
+#[derive(Default)]
 struct Pulled {
     commented: Vec<u64>,
     closed: BTreeMap<u64, String>,
@@ -826,6 +956,87 @@ impl Sync<'_> {
         self.state_set("comments", &serde_json::to_string(&all)?)
             .await?;
         Ok((true, from_comment))
+    }
+
+    async fn apply_field_changes(
+        &self,
+        changes: &[Change],
+        skip: &BTreeSet<u64>,
+    ) -> Result<Pulled> {
+        let mut applied = Pulled::default();
+        let queued: Vec<&FieldChange> = changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Field(field) => Some(field),
+                _ => None,
+            })
+            .filter(|field| {
+                field.issue["number"]
+                    .as_u64()
+                    .is_some_and(|n| !skip.contains(&n))
+            })
+            .collect();
+        if queued.is_empty() {
+            return Ok(applied);
+        }
+        let beads = self.bd.export().await?;
+        let linked = linked(&beads, self.repo());
+        let tracked = self.tracked_comments().await?;
+        for field in queued {
+            let Some(n) = field.issue["number"].as_u64() else {
+                continue;
+            };
+            let Some(id) = linked.get(&n) else { continue };
+            let Some(bead) = self.bd.export().await?.into_iter().find(|b| &b.id == id) else {
+                continue;
+            };
+            let plan = plan_fields(&bead, field);
+            let mut ok = true;
+            if plan.reopen {
+                ok &= self.report(n, "reopen", self.bd.run(&["reopen", id]).await);
+            }
+            if let Some(reason) = plan.close {
+                ok &= self.report(
+                    n,
+                    "close",
+                    self.bd.run(&["close", id, "--force", "-r", reason]).await,
+                );
+            }
+            if !plan.update.is_empty() {
+                ok &= self.report(n, "update", self.bd.update_fields(id, &plan.update).await);
+            }
+            if ok && field.action == "closed" {
+                let info = IssueInfo::from_json(&field.issue);
+                if let Some(mut info) = info {
+                    if let Some(closing) = info.closing.as_mut() {
+                        closing.by = field.sender.clone().or(closing.by.take());
+                    }
+                    if let Some(reason) = info.state_reason {
+                        applied.closed.insert(n, reason);
+                    }
+                    if let Some(closing) = info.closing {
+                        applied.closing.insert(n, closing);
+                    }
+                    if info.comments > 0 || tracked.contains_key(&n) {
+                        applied.commented.push(n);
+                    }
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    fn report<T>(&self, n: u64, what: &str, result: Result<T>) -> bool {
+        match result {
+            Ok(_) => {
+                info!("#{n}: applied {what} from the webhook payload");
+                true
+            }
+            Err(e) => {
+                warn!("#{n}: could not {what}; will retry next run: {e:#}");
+                false
+            }
+        }
     }
 
     async fn apply_changes(&self, changes: &[Change], skip: &BTreeSet<u64>) -> Result<bool> {
@@ -1523,6 +1734,13 @@ impl Sync<'_> {
         let mut pulled = None;
         if !idle {
             pulled = Some(self.pull_issues(since.as_deref()).await?);
+        }
+        let fields = self.apply_field_changes(&changes, &skip).await?;
+        if !fields.closed.is_empty() {
+            let pulled = pulled.get_or_insert_with(Pulled::default);
+            pulled.commented.extend(fields.commented);
+            pulled.closed.extend(fields.closed);
+            pulled.closing.extend(fields.closing);
         }
         if let Err(e) = self.shorten_imports().await {
             warn!("could not shorten imported bead ids: {e:#}");

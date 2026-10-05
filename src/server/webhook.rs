@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
 
-use crate::sync::{Change, CommentAction};
+use crate::sync::{Change, CommentAction, FieldChange, known_label};
 
 pub fn verify(secret: &[u8], body: &[u8], header: Option<&str>) -> bool {
     let Some(sig) = header
@@ -111,6 +111,32 @@ fn change_of(
                 action,
                 comment: payload["comment"].clone(),
             })
+        }
+        "issues" => {
+            if !matches!(
+                action,
+                "edited" | "labeled" | "unlabeled" | "assigned" | "unassigned" | "closed" | "reopened"
+            ) || !payload["issue"]["pull_request"].is_null()
+            {
+                return None;
+            }
+            let label = payload["label"]["name"].as_str().map(str::to_string);
+            if matches!(action, "labeled" | "unlabeled")
+                && !label.as_deref().is_some_and(known_label)
+            {
+                return None;
+            }
+            number_in_repo(&payload["issue"])?;
+            Some(Change::Field(FieldChange {
+                action: action.to_string(),
+                label,
+                changed: payload["changes"]
+                    .as_object()
+                    .map(|c| c.keys().cloned().collect())
+                    .unwrap_or_default(),
+                sender: payload["sender"]["login"].as_str().map(str::to_string),
+                issue: payload["issue"].clone(),
+            }))
         }
         "sub_issues" => {
             let parent = number_in_repo(&payload["parent_issue"])?;
