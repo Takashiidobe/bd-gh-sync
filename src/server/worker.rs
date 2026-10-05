@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -81,9 +81,18 @@ pub struct Context {
     pub secrets: Secrets,
 }
 
+const REMEMBERED_DELIVERIES: usize = 4096;
+
+#[derive(Default)]
+struct Deliveries {
+    order: VecDeque<String>,
+    ids: HashSet<String>,
+}
+
 pub struct Workers {
     ctx: Arc<Context>,
     queues: Mutex<HashMap<String, UnboundedSender<Job>>>,
+    deliveries: Mutex<Deliveries>,
 }
 
 impl Workers {
@@ -91,6 +100,24 @@ impl Workers {
         Self {
             ctx,
             queues: Mutex::default(),
+            deliveries: Mutex::default(),
+        }
+    }
+
+    pub fn seen_delivery(&self, id: &str) -> bool {
+        self.deliveries.lock().unwrap().ids.contains(id)
+    }
+
+    pub fn remember_delivery(&self, id: &str) {
+        let mut deliveries = self.deliveries.lock().unwrap();
+        if !deliveries.ids.insert(id.to_string()) {
+            return;
+        }
+        deliveries.order.push_back(id.to_string());
+        if deliveries.order.len() > REMEMBERED_DELIVERIES
+            && let Some(oldest) = deliveries.order.pop_front()
+        {
+            deliveries.ids.remove(&oldest);
         }
     }
 

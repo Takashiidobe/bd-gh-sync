@@ -144,8 +144,18 @@ async fn receive(
         Ok(payload) => payload,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
     };
+    let delivery = header("x-github-delivery");
+    if let Some(id) = delivery.filter(|id| workers.seen_delivery(id)) {
+        info!("ignored duplicate delivery {id}");
+        return (StatusCode::OK, "duplicate delivery".into());
+    }
     match handle(&workers, event, &payload) {
-        Ok(reply) => reply,
+        Ok(reply) => {
+            if let Some(id) = delivery {
+                workers.remember_delivery(id);
+            }
+            reply
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
