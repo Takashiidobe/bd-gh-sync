@@ -1,6 +1,7 @@
 pub mod config;
 pub mod project;
 pub mod projects;
+pub mod status;
 pub mod webhook;
 pub mod worker;
 
@@ -82,7 +83,11 @@ pub async fn serve(config: Config) -> Result<()> {
     let secrets = Secrets::from_env()?;
     require_projects_token(&config, &secrets)?;
     let listen = config.listen;
-    let workers = Arc::new(Workers::new(Arc::new(Context { config, secrets })));
+    let workers = Arc::new(Workers::new(Arc::new(Context {
+        config,
+        secrets,
+        status: Default::default(),
+    })));
 
     if Project::discover(&workers.context().config.data_dir)?.is_empty() {
         warn!("no projects yet; add one with `bd-gh-sync server add owner/name`");
@@ -110,6 +115,7 @@ pub async fn serve(config: Config) -> Result<()> {
     let app = Router::new()
         .route("/webhook", post(receive))
         .route("/poke", post(poke))
+        .route("/status", get(status))
         .route("/healthz", get(|| async { "ok" }))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(workers);
@@ -148,6 +154,8 @@ async fn poll_dolt_heads(workers: Arc<Workers>, every: std::time::Duration) {
                     continue;
                 }
             };
+            ctx.status
+                .update(&project.repo, |s| s.remote_head = Some(head.clone()));
             let last = seen
                 .entry(project.repo.clone())
                 .or_insert_with(|| project.processed_head());
@@ -158,6 +166,47 @@ async fn poll_dolt_heads(workers: Arc<Workers>, every: std::time::Duration) {
             }
         }
     }
+}
+
+async fn status(
+    State(workers): State<Arc<Workers>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> (StatusCode, String) {
+    let source = peer.ip().to_string();
+    let context = workers.context();
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if workers.blocked(&source) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many failures".into());
+    }
+    if !presented.is_some_and(|p| {
+        webhook::secret_matches(context.secrets.webhook_secret.as_bytes(), p.as_bytes())
+    }) {
+        workers.bad_signature(&source);
+        return (StatusCode::UNAUTHORIZED, "bad token".into());
+    }
+    let projects = match Project::discover(&context.config.data_dir) {
+        Ok(projects) => projects,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let paused = GitHub::new(&context.config.api_url, &context.secrets.token).paused_for();
+    let all: Vec<status::ProjectStatus> = projects
+        .iter()
+        .map(|project| {
+            let mut status = context.status.get(&project.repo);
+            status.repo = project.repo.clone();
+            status.processed_head = project.processed_head();
+            status.rate_limited_secs = paused.map(|p| p.as_secs());
+            status
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        serde_json::to_string_pretty(&all).unwrap_or_default(),
+    )
 }
 
 async fn poke(
@@ -179,7 +228,10 @@ async fn poke(
     let context = workers.context();
     let Some(repo) = repo else {
         workers.bad_signature(&source);
-        return (StatusCode::BAD_REQUEST, "expected {\"repo\": \"owner/name\"}".into());
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected {\"repo\": \"owner/name\"}".into(),
+        );
     };
     let secret = config::repo_secret(&context.config.data_dir, &repo)
         .unwrap_or_else(|| context.secrets.webhook_secret.clone());
@@ -194,7 +246,10 @@ async fn poke(
             workers.submit(&project, Job::Push);
             (StatusCode::ACCEPTED, "queued".into())
         }
-        Ok(None) => (StatusCode::NOT_FOUND, format!("{repo} is not a project here")),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            format!("{repo} is not a project here"),
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }

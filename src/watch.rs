@@ -1411,7 +1411,10 @@ impl Op {
     }
 }
 
-pub(crate) fn native_watcher(dir: &Path, tx: mpsc::UnboundedSender<()>) -> Result<notify::RecommendedWatcher> {
+pub(crate) fn native_watcher(
+    dir: &Path,
+    tx: mpsc::UnboundedSender<()>,
+) -> Result<notify::RecommendedWatcher> {
     use notify::Watcher as _;
     let mut watcher =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {

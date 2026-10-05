@@ -12,6 +12,17 @@ pub fn sign(secret: &[u8], body: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
+pub fn secret_matches(secret: &[u8], presented: &[u8]) -> bool {
+    let tag = |key: &[u8]| {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes keys of any length");
+        mac.update(b"bd-gh-sync");
+        mac
+    };
+    tag(secret)
+        .verify_slice(&tag(presented).finalize().into_bytes())
+        .is_ok()
+}
+
 pub fn verify(secret: &[u8], body: &[u8], header: Option<&str>) -> bool {
     let Some(sig) = header
         .and_then(|h| h.strip_prefix("sha256="))

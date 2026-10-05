@@ -38,7 +38,9 @@ struct Cli {
 enum Command {
     #[command(about = "Pull GitHub issue changes into the beads of the repository here")]
     Sync(SyncArgs),
-    #[command(about = "Push local bead changes to the Dolt remote as they happen, for the server to sync to GitHub")]
+    #[command(
+        about = "Push local bead changes to the Dolt remote as they happen, for the server to sync to GitHub"
+    )]
     Watch(WatchArgs),
     #[command(about = "Compare every linked bead with its GitHub issue and print the drift")]
     Verify {
@@ -50,6 +52,23 @@ enum Command {
         repo: String,
     },
     #[command(about = "Run the webhook server that syncs many repositories")]
+    #[command(about = "Show what a running server is doing: queue, last push and sync, Dolt heads")]
+    Status {
+        #[arg(
+            long,
+            env = "BD_GH_SYNC_URL",
+            default_value = "http://127.0.0.1:8787",
+            help = "Server address (not exposed publicly by the sample Caddyfile; use ssh)"
+        )]
+        url: String,
+        #[arg(
+            long,
+            env = "WEBHOOK_SECRET",
+            hide_env_values = true,
+            help = "The server's WEBHOOK_SECRET"
+        )]
+        secret: String,
+    },
     Server {
         #[arg(
             long,
@@ -278,6 +297,7 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Command::Status { url, secret } => server::status::show(&url, &secret).await,
         Command::Server { config, command } => {
             let config = Config::load(&config)?;
             match command {

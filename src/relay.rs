@@ -134,7 +134,9 @@ impl Relay {
             .and_then(reqwest::Response::error_for_status);
         match sent {
             Ok(_) => info!("poked {url}"),
-            Err(e) => warn!("could not poke {url}: {e}; the server will notice within its poll interval"),
+            Err(e) => {
+                warn!("could not poke {url}: {e}; the server will notice within its poll interval")
+            }
         }
     }
 }

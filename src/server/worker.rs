@@ -19,6 +19,7 @@ use crate::{
     server::{
         config::{Config, Secrets},
         project::Project,
+        status::{self, Seen, Status},
     },
     sync::{Change, Mode},
 };
@@ -39,10 +40,24 @@ pub struct Batch {
     pulls: BTreeSet<u64>,
     since_last: bool,
     push: bool,
+    jobs: u64,
+}
+
+impl Job {
+    fn label(&self) -> &'static str {
+        match self {
+            Job::Issues(_) => "issues",
+            Job::Changes(_) => "changes",
+            Job::Pulls(_) => "pull requests",
+            Job::SinceLast => "since last",
+            Job::Push => "push",
+        }
+    }
 }
 
 impl Batch {
     pub fn add(&mut self, job: Job) {
+        self.jobs += 1;
         match job {
             Job::Issues(issues) => self.issues.extend(issues),
             Job::Changes(changes) => self.changes.extend(changes),
@@ -94,6 +109,7 @@ pub async fn next_batch(
 pub struct Context {
     pub config: Config,
     pub secrets: Secrets,
+    pub status: Status,
 }
 
 const REMEMBERED_DELIVERIES: usize = 4096;
@@ -205,6 +221,13 @@ impl Workers {
                 tokio::spawn(run(self.ctx.clone(), project.clone(), tx.clone(), rx));
                 tx
             });
+        self.ctx.status.update(&project.repo, |s| {
+            s.queued += 1;
+            s.last_event = Some(Seen {
+                what: job.label().into(),
+                at: status::now(),
+            });
+        });
         let _ = tx.send(job);
     }
 }
@@ -260,9 +283,20 @@ async fn run(
 ) {
     let config = &ctx.config;
     while let Some(mut batch) = next_batch(&mut rx, config.debounce(), config.max_wait()).await {
-        if std::mem::take(&mut batch.push)
-            && let Err(e) = project.push(config, &ctx.secrets).await
-        {
+        ctx.status.update(&project.repo, |s| {
+            s.queued = s.queued.saturating_sub(batch.jobs)
+        });
+        let pushed = if std::mem::take(&mut batch.push) {
+            Some(project.push(config, &ctx.secrets).await)
+        } else {
+            None
+        };
+        if let Some(result) = &pushed {
+            ctx.status.update(&project.repo, |s| {
+                s.last_push = Some(status::attempt(result))
+            });
+        }
+        if let Some(Err(e)) = pushed {
             error!(project = %project.repo, "push failed: {e:#}; retrying in {}s", RETRY_AFTER.as_secs());
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -284,7 +318,11 @@ async fn run(
         if batch.is_empty() {
             continue;
         }
-        match project.sync(config, &ctx.secrets, batch.mode()).await {
+        let synced = project.sync(config, &ctx.secrets, batch.mode()).await;
+        ctx.status.update(&project.repo, |s| {
+            s.last_sync = Some(status::attempt(&synced))
+        });
+        match synced {
             Ok(()) => info!(project = %project.repo, "sync done"),
             Err(e) => {
                 error!(project = %project.repo, "sync failed: {e:#}; retrying in {}s", RETRY_AFTER.as_secs());
