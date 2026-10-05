@@ -572,6 +572,27 @@ impl Watcher {
                 outcome = Outcome::Failed;
                 continue;
             }
+            let reason = beads
+                .iter()
+                .find(|b| b.id == id)
+                .and_then(|b| b.close_reason.as_deref())
+                .map(str::trim)
+                .filter(|r| !r.is_empty());
+            if let Some(reason) = reason {
+                match self.post_close_reason(&path, reason).await {
+                    Ok(true) => {
+                        info!("{id}: posted the close reason");
+                        outcome.pushed();
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!("{id}: could not post the close reason; will retry: {e:#}");
+                        revert(&mut current);
+                        outcome = Outcome::Failed;
+                        continue;
+                    }
+                }
+            }
             if let Some((_, target)) = want.split_once(':') {
                 match self
                     .mark_duplicate(&issue.body, &links[target], target, &id)
@@ -618,6 +639,30 @@ impl Watcher {
         }
         self.save(file, &current)?;
         Ok(outcome)
+    }
+
+    async fn post_close_reason(&self, path: &str, reason: &str) -> Result<bool> {
+        let marker = format!("{COMMENT_MARKER}close-reason -->");
+        let existing = self
+            .gh
+            .get_all(&format!("{path}/comments?per_page=100"))
+            .await?;
+        let posted = existing.iter().any(|c| {
+            let body = c["body"].as_str().unwrap_or("");
+            (body.contains(&marker) && body.contains(reason))
+                || normalize(body) == normalize(reason)
+        });
+        if posted {
+            return Ok(false);
+        }
+        let body = json!({"body": format!("**Close reason**\n\n{reason}\n\n{marker}")});
+        let resp = self
+            .call(Method::POST, &format!("{path}/comments"), Some(&body))
+            .await;
+        if !resp.ok() {
+            bail!("HTTP {}", resp.status);
+        }
+        Ok(true)
     }
 
     async fn mark_duplicate(

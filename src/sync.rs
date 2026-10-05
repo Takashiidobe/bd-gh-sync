@@ -44,6 +44,7 @@ pub const COMMENT_MARKER: &str = "<!-- bd-comment:";
 pub const LINKED_PR_COMMENT: &str = "Linked pull request:";
 const EDITED_COMMENT: &str = "Edited on GitHub:";
 const DELETED_COMMENT: &str = "Deleted on GitHub:";
+const CLOSE_COMMENT_WINDOW: Duration = Duration::from_secs(10);
 
 pub fn is_sync_note(text: &str) -> bool {
     [LINKED_PR_COMMENT, EDITED_COMMENT, DELETED_COMMENT]
@@ -121,6 +122,13 @@ struct GithubLinks {
 struct Pulled {
     commented: Vec<u64>,
     closed: BTreeMap<u64, String>,
+    closing: BTreeMap<u64, Closing>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Closing {
+    at: String,
+    by: Option<String>,
 }
 
 struct Sync<'a> {
@@ -141,6 +149,7 @@ pub struct IssueInfo {
     pub bd_created: bool,
     pub comments: u64,
     pub state_reason: Option<String>,
+    pub closing: Option<Closing>,
 }
 
 impl IssueInfo {
@@ -166,6 +175,13 @@ impl IssueInfo {
                     .unwrap_or("completed")
                     .to_string()
             }),
+            closing: (issue["state"] == "closed")
+                .then(|| issue["closed_at"].as_str())
+                .flatten()
+                .map(|at| Closing {
+                    at: at.to_string(),
+                    by: issue["closed_by"]["login"].as_str().map(str::to_string),
+                }),
         })
     }
 }
@@ -230,6 +246,38 @@ fn close_reason_for(state_reason: &str) -> Option<&'static str> {
 
 pub fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn close_comment(github: &[Value], closing: &Closing) -> Option<(u64, String)> {
+    let closed_at = humantime::parse_rfc3339(&closing.at).ok()?;
+    github
+        .iter()
+        .filter(|c| {
+            !c["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(COMMENT_MARKER)
+        })
+        .filter(|c| {
+            closing
+                .by
+                .as_deref()
+                .is_none_or(|by| c["user"]["login"].as_str() == Some(by))
+        })
+        .rfind(|c| {
+            c["created_at"]
+                .as_str()
+                .and_then(|t| humantime::parse_rfc3339(t).ok())
+                .and_then(|t| closed_at.duration_since(t).ok())
+                .is_some_and(|gap| gap <= CLOSE_COMMENT_WINDOW)
+        })
+        .map(|c| {
+            (
+                c["id"].as_u64().unwrap_or_default(),
+                normalize(c["body"].as_str().unwrap_or_default()),
+            )
+        })
+        .filter(|(id, text)| *id != 0 && !text.is_empty())
 }
 
 pub type Tracked = BTreeMap<u64, (String, String)>;
@@ -525,6 +573,7 @@ impl Sync<'_> {
         let mut to_pull = Vec::new();
         let mut commented = Vec::new();
         let mut closed = BTreeMap::new();
+        let mut closing = BTreeMap::new();
         let tracked = self.tracked_comments().await?;
         let (issues, missing) = self.describe_issues(since, &linked).await?;
         self.resolve_gone(&missing, &linked).await?;
@@ -546,13 +595,20 @@ impl Sync<'_> {
             if let Some(reason) = issue.state_reason {
                 closed.insert(issue.number, reason);
             }
+            if let Some(info) = issue.closing {
+                closing.insert(issue.number, info);
+            }
             if issue.comments > 0 || tracked.contains_key(&issue.number) {
                 commented.push(issue.number);
             }
         }
         if to_pull.is_empty() {
             info!("no issues to pull");
-            return Ok(Pulled { commented, closed });
+            return Ok(Pulled {
+                commented,
+                closed,
+                closing,
+            });
         }
         let list: Vec<String> = to_pull.iter().map(u64::to_string).collect();
         info!("pulling {} issue(s): {}", to_pull.len(), list.join(" "));
@@ -564,16 +620,27 @@ impl Sync<'_> {
         {
             info!("{line}");
         }
-        Ok(Pulled { commented, closed })
+        Ok(Pulled {
+            commented,
+            closed,
+            closing,
+        })
     }
 
-    async fn import_close_reasons(&self, closed: &BTreeMap<u64, String>) -> Result<()> {
+    async fn import_close_reasons(
+        &self,
+        closed: &BTreeMap<u64, String>,
+        from_comment: &BTreeSet<u64>,
+    ) -> Result<()> {
         if closed.is_empty() {
             return Ok(());
         }
         let beads = self.bd.export().await?;
         let linked = linked(&beads, self.repo());
         for (n, state_reason) in closed {
+            if from_comment.contains(n) {
+                continue;
+            }
             let Some(label) = close_reason_for(state_reason) else {
                 continue;
             };
@@ -606,9 +673,14 @@ impl Sync<'_> {
         }
     }
 
-    async fn import_comments(&self, numbers: &[u64]) -> Result<bool> {
+    async fn import_comments(
+        &self,
+        numbers: &[u64],
+        closing: &BTreeMap<u64, Closing>,
+    ) -> Result<(bool, BTreeSet<u64>)> {
+        let mut from_comment = BTreeSet::new();
         if numbers.is_empty() {
-            return Ok(false);
+            return Ok((false, from_comment));
         }
         let beads = self.bd.export().await?;
         let linked = linked(&beads, self.repo());
@@ -639,12 +711,29 @@ impl Sync<'_> {
                 .map(|c| (c.author.clone().unwrap_or_default(), c.text.clone()))
                 .collect();
             let previous = before.get(n).cloned().unwrap_or_default();
-            let plan = plan_comments(&github, &have, &previous);
+            let mut plan = plan_comments(&github, &have, &previous);
             let mut tracked = plan.tracked.clone();
             let revert = |cid: u64, tracked: &mut Tracked| match previous.get(&cid) {
                 Some(entry) => tracked.insert(cid, entry.clone()),
                 None => tracked.remove(&cid),
             };
+            let closer = closing
+                .get(n)
+                .filter(|_| bead.is_closed())
+                .and_then(|c| close_comment(&github, c));
+            if let Some((cid, text)) = closer {
+                plan.add.retain(|(added, ..)| *added != cid);
+                from_comment.insert(*n);
+                if bead.close_reason.as_deref().map(normalize).as_deref() != Some(text.as_str()) {
+                    match self.bd.set_close_reason(id, &text).await {
+                        Ok(()) => info!("#{n}: closing comment became the close reason"),
+                        Err(e) => {
+                            warn!("#{n}: could not set the close reason: {e:#}");
+                            revert(cid, &mut tracked);
+                        }
+                    }
+                }
+            }
             for (cid, author, text) in &plan.add {
                 match self.bd.comment_add(id, author, text).await {
                     Ok(()) => info!("#{n}: imported a comment by {author}"),
@@ -681,11 +770,11 @@ impl Sync<'_> {
             }
         }
         if all == before {
-            return Ok(false);
+            return Ok((false, from_comment));
         }
         self.state_set("comments", &serde_json::to_string(&all)?)
             .await?;
-        Ok(true)
+        Ok((true, from_comment))
     }
 
     async fn github_relations(&self) -> Result<GithubLinks> {
@@ -999,8 +1088,11 @@ impl Sync<'_> {
             }
         }
         let pulled = self.pull_issues(since.as_deref()).await?;
-        self.import_close_reasons(&pulled.closed).await?;
-        let comments_changed = self.import_comments(&pulled.commented).await?;
+        let (comments_changed, from_comment) = self
+            .import_comments(&pulled.commented, &pulled.closing)
+            .await?;
+        self.import_close_reasons(&pulled.closed, &from_comment)
+            .await?;
         let relations_changed = self.sync_relations().await?;
         let changed =
             relations_changed || comments_changed || self.bd.export_raw().await? != before;
