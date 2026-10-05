@@ -10,8 +10,6 @@
 	<array>
 		<string>@HOME@/.local/bin/bd-gh-sync</string>
 		<string>watch</string>
-		<string>--dolt-sync</string>
-		<string>30</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>

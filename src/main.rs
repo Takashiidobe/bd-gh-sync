@@ -1,6 +1,7 @@
 mod bd;
 mod github;
 mod ids;
+mod relay;
 mod server;
 mod sync;
 mod watch;
@@ -37,7 +38,7 @@ struct Cli {
 enum Command {
     #[command(about = "Pull GitHub issue changes into the beads of the repository here")]
     Sync(SyncArgs),
-    #[command(about = "Push local bead changes to GitHub issues as they happen")]
+    #[command(about = "Push local bead changes to the Dolt remote as they happen, for the server to sync to GitHub")]
     Watch(WatchArgs),
     #[command(about = "Compare every linked bead with its GitHub issue and print the drift")]
     Verify {
@@ -106,6 +107,30 @@ struct SyncArgs {
 
 #[derive(Args)]
 struct WatchArgs {
+    #[arg(
+        long,
+        help = "Push to GitHub from this machine (needs a GitHub token) instead of handing off to the server"
+    )]
+    local: bool,
+    #[arg(
+        long,
+        env = "BD_GH_SYNC_POKE_URL",
+        help = "Server /poke URL to nudge after each push (the server also polls)"
+    )]
+    poke_url: Option<String>,
+    #[arg(
+        long,
+        env = "BD_GH_SYNC_POKE_SECRET",
+        hide_env_values = true,
+        help = "The repository's webhook secret, used to sign the poke"
+    )]
+    poke_secret: Option<String>,
+    #[arg(
+        long,
+        env = "GITHUB_REPOSITORY",
+        help = "owner/name [default: bd's github.repository]"
+    )]
+    repo: Option<String>,
     #[arg(long, help = "Run a single sync pass and exit")]
     once: bool,
     #[arg(
@@ -227,6 +252,18 @@ async fn main() -> Result<()> {
             }
             println!("beads and GitHub agree");
             Ok(())
+        }
+        Command::Watch(args) if !args.local => {
+            relay::run(relay::Options {
+                once: args.once,
+                poll: Duration::from_secs_f64(args.poll),
+                debounce: Duration::from_secs_f64(args.debounce),
+                backend: args.backend,
+                poke_url: args.poke_url,
+                poke_secret: args.poke_secret,
+                repo: args.repo,
+            })
+            .await
         }
         Command::Watch(args) => {
             watch::run(watch::Options {

@@ -64,7 +64,7 @@ impl Outcome {
 
 const IGNORED_SUFFIXES: &[&str] = &[".jsonl", ".log", ".lock", ".pid", ".port", ".activity"];
 const DRAIN_CAP: Duration = Duration::from_secs(10);
-const SETTLE: Duration = Duration::from_millis(500);
+pub(crate) const SETTLE: Duration = Duration::from_millis(500);
 
 pub fn issue_path(external_ref: &str) -> Option<String> {
     let rest = external_ref
@@ -140,7 +140,7 @@ fn matches_issue(bead: &Bead, issue: &Value) -> bool {
         && priority.is_some_and(|p| labels.contains(&format!("priority::{p}").as_str()))
 }
 
-fn ignored(path: &Path) -> bool {
+pub(crate) fn ignored(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
@@ -152,7 +152,7 @@ fn ignored(path: &Path) -> bool {
             .any(|c| c.as_os_str().to_string_lossy().starts_with("bd.sock"))
 }
 
-fn is_write(kind: &notify::EventKind) -> bool {
+pub(crate) fn is_write(kind: &notify::EventKind) -> bool {
     use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
     match kind {
         EventKind::Create(_) | EventKind::Remove(_) => true,
@@ -171,16 +171,7 @@ struct Watcher {
 }
 
 pub async fn run(opts: Options) -> Result<()> {
-    let start = std::env::current_dir()?;
-    let beads_dir = start
-        .ancestors()
-        .map(|d| d.join(".beads"))
-        .find(|d| d.is_dir())
-        .context("no .beads directory found (run bd init first)")?;
-    let root = beads_dir
-        .parent()
-        .expect(".beads has a parent")
-        .to_path_buf();
+    let (beads_dir, root) = find_beads()?;
 
     let mut wd = Workdir::new(&root).env("BD_NO_DEP_TYPE_WARNING", "1");
     let token = match std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
@@ -223,6 +214,20 @@ pub async fn run(opts: Options) -> Result<()> {
         result = watcher.watch(&beads_dir) => result,
         _ = crate::server::shutdown() => Ok(()),
     }
+}
+
+pub(crate) fn find_beads() -> Result<(PathBuf, PathBuf)> {
+    let start = std::env::current_dir()?;
+    let beads_dir = start
+        .ancestors()
+        .map(|d| d.join(".beads"))
+        .find(|d| d.is_dir())
+        .context("no .beads directory found (run bd init first)")?;
+    let root = beads_dir
+        .parent()
+        .expect(".beads has a parent")
+        .to_path_buf();
+    Ok((beads_dir, root))
 }
 
 async fn state_dir(wd: &Workdir, beads_dir: &Path) -> Result<PathBuf> {
@@ -1406,7 +1411,7 @@ impl Op {
     }
 }
 
-fn native_watcher(dir: &Path, tx: mpsc::UnboundedSender<()>) -> Result<notify::RecommendedWatcher> {
+pub(crate) fn native_watcher(dir: &Path, tx: mpsc::UnboundedSender<()>) -> Result<notify::RecommendedWatcher> {
     use notify::Watcher as _;
     let mut watcher =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
@@ -1420,7 +1425,7 @@ fn native_watcher(dir: &Path, tx: mpsc::UnboundedSender<()>) -> Result<notify::R
     Ok(watcher)
 }
 
-async fn drain(rx: &mut mpsc::UnboundedReceiver<()>, quiet: Duration) {
+pub(crate) async fn drain(rx: &mut mpsc::UnboundedReceiver<()>, quiet: Duration) {
     let deadline = tokio::time::Instant::now() + DRAIN_CAP;
     while let Ok(Some(())) =
         tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + quiet), rx.recv()).await

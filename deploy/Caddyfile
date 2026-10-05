@@ -1,7 +1,7 @@
 # Caddy terminates HTTPS (certificates are automatic) and forwards only the
-# webhook and health endpoints to bd-gh-sync on localhost.
+# webhook, poke and health endpoints to bd-gh-sync on localhost.
 sync.example.com {
-	@sync path /webhook /healthz
+	@sync path /webhook /poke /healthz
 	handle @sync {
 		request_body {
 			max_size 1MB

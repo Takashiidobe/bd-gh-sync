@@ -6,6 +6,12 @@ use sha2::Sha256;
 
 use crate::sync::{Change, CommentAction, FieldChange, known_label};
 
+pub fn sign(secret: &[u8], body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC takes keys of any length");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
 pub fn verify(secret: &[u8], body: &[u8], header: Option<&str>) -> bool {
     let Some(sig) = header
         .and_then(|h| h.strip_prefix("sha256="))
