@@ -262,19 +262,16 @@ impl<'a> Bd<'a> {
         Ok(json_field(&out.stdout, "value"))
     }
 
-    pub async fn kv_get(&self, key: &str) -> Result<Option<String>> {
-        let out = self.output(&["kv", "get", key, "--json"]).await?;
-        let found = serde_json::from_str::<Value>(&out.stdout)
-            .is_ok_and(|v| v["found"].as_bool() == Some(true));
-        Ok(if found {
-            json_field(&out.stdout, "value")
-        } else {
-            None
-        })
-    }
-
-    pub async fn kv_set(&self, key: &str, value: &str) -> Result<()> {
-        self.run(&["kv", "set", key, value]).await.map(drop)
+    pub async fn kv_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let out = self.output(&["kv", "list", "--json"]).await?;
+        let all: serde_json::Map<String, Value> = serde_json::from_str(&out.stdout)?;
+        Ok(all
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let key = key.strip_prefix(prefix)?.to_string();
+                Some((key, value.as_str()?.to_string()))
+            })
+            .collect())
     }
 
     pub async fn dolt_commit(&self, message: &str) -> Result<()> {

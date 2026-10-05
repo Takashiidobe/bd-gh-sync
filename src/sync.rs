@@ -284,10 +284,13 @@ pub async fn run(wd: &Workdir, gh: &GitHub, opts: &Options) -> Result<()> {
         mode: opts.mode.clone(),
         next_since: humantime::format_rfc3339_seconds(SystemTime::now() - Duration::from_secs(120))
             .to_string(),
-        state_file: wd
-            .dir
-            .join(opts.jsonl.parent().unwrap_or(Path::new("")))
-            .join("github-sync.json"),
+        state_file: if transport == Transport::Dolt {
+            dolt_state_file(wd).await
+        } else {
+            wd.dir
+                .join(opts.jsonl.parent().unwrap_or(Path::new("")))
+                .join("github-sync.json")
+        },
         marks: Default::default(),
     };
     let started = Instant::now();
@@ -300,6 +303,14 @@ pub async fn run(wd: &Workdir, gh: &GitHub, opts: &Options) -> Result<()> {
         "sync pass completed"
     );
     result
+}
+
+async fn dolt_state_file(wd: &Workdir) -> PathBuf {
+    let git_dir = match wd.output("git", &["rev-parse", "--absolute-git-dir"]).await {
+        Ok(out) if out.success => PathBuf::from(out.stdout.trim()),
+        _ => wd.dir.join(".beads"),
+    };
+    git_dir.join("bd-gh-sync").join("sync-state.json")
 }
 
 pub async fn verify(wd: &Workdir, gh: &GitHub, repo: &str) -> Result<usize> {
@@ -1057,41 +1068,30 @@ impl Sync<'_> {
     }
 
     async fn state_get(&self, key: &str) -> Result<Option<String>> {
-        match self.transport {
-            Transport::Dolt => self.bd.kv_get(&format!("bd-gh-sync.{key}")).await,
-            _ => {
-                let Ok(text) = std::fs::read_to_string(&self.state_file) else {
-                    return Ok(None);
-                };
-                let state: Value = serde_json::from_str(&text)
-                    .with_context(|| format!("parsing {}", self.state_file.display()))?;
-                Ok(state[key]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string))
+        if let Ok(text) = std::fs::read_to_string(&self.state_file) {
+            let state: Value = serde_json::from_str(&text)
+                .with_context(|| format!("parsing {}", self.state_file.display()))?;
+            if let Some(value) = state[key].as_str().filter(|s| !s.is_empty()) {
+                return Ok(Some(value.to_string()));
             }
         }
+        Ok(None)
     }
 
     async fn state_set(&self, key: &str, value: &str) -> Result<()> {
-        match self.transport {
-            Transport::Dolt => self.bd.kv_set(&format!("bd-gh-sync.{key}"), value).await,
-            _ => {
-                let mut state: Value = std::fs::read_to_string(&self.state_file)
-                    .ok()
-                    .and_then(|t| serde_json::from_str(&t).ok())
-                    .unwrap_or_else(|| json!({}));
-                state[key] = Value::String(value.to_string());
-                if let Some(dir) = self.state_file.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                std::fs::write(
-                    &self.state_file,
-                    format!("{}\n", serde_json::to_string_pretty(&state)?),
-                )?;
-                Ok(())
-            }
+        let mut state: Value = std::fs::read_to_string(&self.state_file)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| json!({}));
+        state[key] = Value::String(value.to_string());
+        if let Some(dir) = self.state_file.parent() {
+            std::fs::create_dir_all(dir)?;
         }
+        std::fs::write(
+            &self.state_file,
+            format!("{}\n", serde_json::to_string_pretty(&state)?),
+        )?;
+        Ok(())
     }
 
     fn mark(&self, key: String, at: String) {
@@ -2497,8 +2497,34 @@ impl Sync<'_> {
         Ok(changed)
     }
 
+    async fn adopt_kv_state(&self) -> Result<()> {
+        if self.state_file.exists() {
+            return Ok(());
+        }
+        let state: serde_json::Map<String, Value> = self
+            .bd
+            .kv_with_prefix("bd-gh-sync.")
+            .await?
+            .into_iter()
+            .map(|(key, value)| (key, Value::String(value)))
+            .collect();
+        if state.is_empty() {
+            return Ok(());
+        }
+        info!("moving {} sync state value(s) out of Dolt", state.len());
+        if let Some(dir) = self.state_file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(
+            &self.state_file,
+            format!("{}\n", serde_json::to_string_pretty(&state)?),
+        )?;
+        Ok(())
+    }
+
     async fn via_dolt(&mut self) -> Result<()> {
         self.bd.bootstrap().await?;
+        self.adopt_kv_state().await?;
         for attempt in 1..=ATTEMPTS {
             self.bd.dolt_commit("bd-gh-sync: local state").await?;
             if let Err(e) = self.bd.dolt_pull().await {
