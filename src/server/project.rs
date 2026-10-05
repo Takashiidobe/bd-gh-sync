@@ -37,6 +37,9 @@ pub fn describe(mode: &Mode) -> String {
             let numbers: Vec<String> = numbers.iter().map(u64::to_string).collect();
             format!("issues {}", numbers.join(" "))
         }
+        Mode::Events { issues, changes } => {
+            format!("{} event(s) and {} issue(s)", changes.len(), issues.len())
+        }
         Mode::SinceLast => "everything since the last sync".into(),
         Mode::All => "every issue".into(),
     }

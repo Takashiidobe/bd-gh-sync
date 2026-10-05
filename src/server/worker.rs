@@ -15,18 +15,20 @@ use crate::{
         config::{Config, Secrets},
         project::Project,
     },
-    sync::Mode,
+    sync::{Change, Mode},
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Job {
     Issues(BTreeSet<u64>),
+    Changes(Vec<Change>),
     SinceLast,
 }
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Batch {
     issues: BTreeSet<u64>,
+    changes: Vec<Change>,
     since_last: bool,
 }
 
@@ -34,19 +36,25 @@ impl Batch {
     pub fn add(&mut self, job: Job) {
         match job {
             Job::Issues(issues) => self.issues.extend(issues),
+            Job::Changes(changes) => self.changes.extend(changes),
             Job::SinceLast => self.since_last = true,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.issues.is_empty() && !self.since_last
+        self.issues.is_empty() && self.changes.is_empty() && !self.since_last
     }
 
     pub fn mode(&self) -> Mode {
         if self.since_last {
             Mode::SinceLast
-        } else {
+        } else if self.changes.is_empty() {
             Mode::Issues(self.issues.iter().copied().collect())
+        } else {
+            Mode::Events {
+                issues: self.issues.iter().copied().collect(),
+                changes: self.changes.clone(),
+            }
         }
     }
 }

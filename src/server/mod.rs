@@ -176,6 +176,7 @@ fn handle(
         }
         Event::Ignored(why) => return Ok((StatusCode::ACCEPTED, format!("ignored: {why}"))),
         Event::Sync { repo, issues } => (repo, Job::Issues(issues)),
+        Event::Changes { repo, changes } => (repo, Job::Changes(changes)),
         Event::Reconcile { repo } => (repo, Job::SinceLast),
     };
     let Some(project) = Project::find(&workers.context().config.data_dir, &repo)? else {
@@ -184,7 +185,12 @@ fn handle(
             format!("ignored: {repo} is not a project here"),
         ));
     };
-    info!(project = %project.repo, "{event}: queued {job:?}");
+    match &job {
+        Job::Changes(changes) => {
+            info!(project = %project.repo, "{event}: queued {} change(s)", changes.len())
+        }
+        job => info!(project = %project.repo, "{event}: queued {job:?}"),
+    }
     workers.submit(&project, job);
     Ok((StatusCode::ACCEPTED, "queued".into()))
 }

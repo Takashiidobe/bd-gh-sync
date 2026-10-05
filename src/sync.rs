@@ -18,8 +18,46 @@ use crate::{
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Issues(Vec<u64>),
+    Events {
+        issues: Vec<u64>,
+        changes: Vec<Change>,
+    },
     SinceLast,
     All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CommentAction {
+    Created,
+    Edited,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    Comment {
+        issue: u64,
+        action: CommentAction,
+        comment: Value,
+    },
+    Relation {
+        edge: String,
+        added: bool,
+    },
+}
+
+impl Change {
+    fn issues(&self) -> Vec<u64> {
+        match self {
+            Change::Comment { issue, .. } => vec![*issue],
+            Change::Relation { edge, .. } => edge_numbers(edge).into_iter().collect(),
+        }
+    }
+}
+
+fn edge_numbers(edge: &str) -> [u64; 2] {
+    let parts: Vec<&str> = edge.split(' ').collect();
+    [parts[0], parts[2]].map(|n| n.parse().unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum, serde::Deserialize)]
@@ -387,12 +425,7 @@ pub fn plan_relations(
     }
 }
 
-const RELATIONS_QUERY: &str = r#"query($owner: String!, $repo: String!, $endCursor: String) {
-  repository(owner: $owner, name: $repo) {
-    issues(first: 100, after: $endCursor) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        number
+const NODE_FIELDS: &str = r#"number
         parent { number repository { nameWithOwner } }
         blockedBy(first: 100) { nodes { number repository { nameWithOwner } } }
         duplicateOf { number repository { nameWithOwner } }
@@ -405,11 +438,54 @@ const RELATIONS_QUERY: &str = r#"query($owner: String!, $repo: String!, $endCurs
               source { ... on Issue { number repository { nameWithOwner } } }
             }
           }
-        }
-      }
-    }
-  }
-}"#;
+        }"#;
+
+const SCOPED_CHUNK: usize = 25;
+
+fn relations_query() -> String {
+    format!(
+        "query($owner: String!, $repo: String!, $endCursor: String) {{
+  repository(owner: $owner, name: $repo) {{
+    issues(first: 100, after: $endCursor) {{
+      pageInfo {{ hasNextPage endCursor }}
+      nodes {{ {NODE_FIELDS} }}
+    }}
+  }}
+}}"
+    )
+}
+
+fn scoped_query(numbers: &[u64]) -> String {
+    let issues: String = numbers
+        .iter()
+        .map(|n| format!("i{n}: issue(number: {n}) {{ {NODE_FIELDS} }}\n"))
+        .collect();
+    format!(
+        "query($owner: String!, $repo: String!) {{ repository(owner: $owner, name: $repo) {{ {issues} }} }}"
+    )
+}
+
+fn relation_edges(beads: &[Bead], linked: &BTreeMap<u64, String>) -> BTreeSet<String> {
+    let number_of: BTreeMap<&str, u64> = linked.iter().map(|(n, id)| (id.as_str(), *n)).collect();
+    beads
+        .iter()
+        .flat_map(Bead::relations)
+        .filter_map(|d| {
+            Some(format!(
+                "{} {} {}",
+                number_of.get(d.issue_id.as_str())?,
+                d.kind,
+                number_of.get(d.depends_on_id.as_str())?
+            ))
+        })
+        .collect()
+}
+
+fn edge_beads(edge: &str, linked: &BTreeMap<u64, String>) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = edge.split(' ').collect();
+    let id = |n: &str| linked.get(&n.parse::<u64>().ok()?).cloned();
+    Some((id(parts[0])?, parts[1].to_string(), id(parts[2])?))
+}
 
 impl Sync<'_> {
     fn repo(&self) -> &str {
@@ -736,35 +812,8 @@ impl Sync<'_> {
                     }
                 }
             }
-            for (cid, author, text) in &plan.add {
-                match self.bd.comment_add(id, author, text).await {
-                    Ok(()) => info!("#{n}: imported a comment by {author}"),
-                    Err(e) => {
-                        warn!("#{n}: could not import a comment by {author}: {e:#}");
-                        revert(*cid, &mut tracked);
-                    }
-                }
-            }
-            for (cid, author, text) in &plan.edited {
-                let note = format!("{EDITED_COMMENT} {text}");
-                match self.bd.comment_add(id, author, &note).await {
-                    Ok(()) => info!("#{n}: noted an edit by {author}"),
-                    Err(e) => {
-                        warn!("#{n}: could not note an edit by {author}: {e:#}");
-                        revert(*cid, &mut tracked);
-                    }
-                }
-            }
-            for (cid, author) in &plan.deleted {
-                let note = format!("{DELETED_COMMENT} a comment by {author}");
-                match self.bd.comment_add(id, author, &note).await {
-                    Ok(()) => info!("#{n}: noted a deleted comment by {author}"),
-                    Err(e) => {
-                        warn!("#{n}: could not note a deleted comment by {author}: {e:#}");
-                        tracked.insert(*cid, previous[cid].clone());
-                    }
-                }
-            }
+            self.apply_comment_plan(*n, id, &plan, &mut tracked, &previous)
+                .await;
             if tracked.is_empty() {
                 all.remove(n);
             } else {
@@ -779,19 +828,217 @@ impl Sync<'_> {
         Ok((true, from_comment))
     }
 
-    async fn github_relations(&self) -> Result<GithubLinks> {
+    async fn apply_changes(&self, changes: &[Change], skip: &BTreeSet<u64>) -> Result<bool> {
+        let comments = self.apply_comment_changes(changes, skip).await?;
+        let relations = self.apply_relation_changes(changes, skip).await?;
+        Ok(comments || relations)
+    }
+
+    async fn apply_comment_plan(
+        &self,
+        n: u64,
+        id: &str,
+        plan: &CommentPlan,
+        tracked: &mut Tracked,
+        previous: &Tracked,
+    ) {
+        let revert = |cid: u64, tracked: &mut Tracked| match previous.get(&cid) {
+            Some(entry) => tracked.insert(cid, entry.clone()),
+            None => tracked.remove(&cid),
+        };
+        for (cid, author, text) in &plan.add {
+            match self.bd.comment_add(id, author, text).await {
+                Ok(()) => info!("#{n}: imported a comment by {author}"),
+                Err(e) => {
+                    warn!("#{n}: could not import a comment by {author}: {e:#}");
+                    revert(*cid, tracked);
+                }
+            }
+        }
+        for (cid, author, text) in &plan.edited {
+            let note = format!("{EDITED_COMMENT} {text}");
+            match self.bd.comment_add(id, author, &note).await {
+                Ok(()) => info!("#{n}: noted an edit by {author}"),
+                Err(e) => {
+                    warn!("#{n}: could not note an edit by {author}: {e:#}");
+                    revert(*cid, tracked);
+                }
+            }
+        }
+        for (cid, author) in &plan.deleted {
+            let note = format!("{DELETED_COMMENT} a comment by {author}");
+            match self.bd.comment_add(id, author, &note).await {
+                Ok(()) => info!("#{n}: noted a deleted comment by {author}"),
+                Err(e) => {
+                    warn!("#{n}: could not note a deleted comment by {author}: {e:#}");
+                    tracked.insert(*cid, previous[cid].clone());
+                }
+            }
+        }
+    }
+
+    async fn apply_comment_changes(
+        &self,
+        changes: &[Change],
+        skip: &BTreeSet<u64>,
+    ) -> Result<bool> {
+        let queued: Vec<(u64, CommentAction, &Value)> = changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Comment {
+                    issue,
+                    action,
+                    comment,
+                } if !skip.contains(issue) => Some((*issue, *action, comment)),
+                _ => None,
+            })
+            .collect();
+        if queued.is_empty() {
+            return Ok(false);
+        }
+        let beads = self.bd.export().await?;
+        let linked = linked(&beads, self.repo());
+        let before = self.tracked_comments().await?;
+        let mut all = before.clone();
+        for (n, action, comment) in queued {
+            let Some(id) = linked.get(&n) else { continue };
+            let Some(bead) = beads.iter().find(|b| &b.id == id) else {
+                continue;
+            };
+            let Some(cid) = comment["id"].as_u64() else {
+                continue;
+            };
+            let previous = all.get(&n).cloned().unwrap_or_default();
+            let mut tracked = previous.clone();
+            let plan = match action {
+                CommentAction::Deleted => {
+                    tracked.remove(&cid);
+                    CommentPlan {
+                        deleted: previous
+                            .get(&cid)
+                            .map(|(author, _)| (cid, author.clone()))
+                            .into_iter()
+                            .collect(),
+                        ..CommentPlan::default()
+                    }
+                }
+                _ => {
+                    let have: Vec<(String, String)> = bead
+                        .comments()
+                        .iter()
+                        .map(|c| (c.author.clone().unwrap_or_default(), c.text.clone()))
+                        .collect();
+                    let known: Tracked = previous
+                        .iter()
+                        .filter(|(known, _)| **known == cid)
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect();
+                    let plan = plan_comments(std::slice::from_ref(comment), &have, &known);
+                    tracked.extend(plan.tracked.clone());
+                    plan
+                }
+            };
+            self.apply_comment_plan(n, id, &plan, &mut tracked, &previous)
+                .await;
+            if tracked.is_empty() {
+                all.remove(&n);
+            } else {
+                all.insert(n, tracked);
+            }
+        }
+        if all == before {
+            return Ok(false);
+        }
+        self.state_set("comments", &serde_json::to_string(&all)?)
+            .await?;
+        Ok(true)
+    }
+
+    async fn apply_relation_changes(
+        &self,
+        changes: &[Change],
+        skip: &BTreeSet<u64>,
+    ) -> Result<bool> {
+        let queued: Vec<(&str, bool)> = changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Relation { edge, added } if !skip.contains(&edge_numbers(edge)[0]) => {
+                    Some((edge.as_str(), *added))
+                }
+                _ => None,
+            })
+            .collect();
+        if queued.is_empty() {
+            return Ok(false);
+        }
+        let beads = self.bd.export().await?;
+        let linked = linked(&beads, self.repo());
+        let have = relation_edges(&beads, &linked);
+        let recorded = self.recorded_relations().await?;
+        let mut next = recorded.clone();
+        for (edge, added) in queued {
+            let Some((from, kind, to)) = edge_beads(edge, &linked) else {
+                continue;
+            };
+            let shown = edge_for_log(edge);
+            if added {
+                if !have.contains(edge) {
+                    if let Err(e) = self.bd.dep_add(&from, &to, &kind).await {
+                        warn!("{shown}: could not add; will retry next run: {e:#}");
+                        continue;
+                    }
+                    info!("{shown}: added");
+                }
+                next.insert(edge.to_string());
+            } else if recorded.contains(edge) {
+                if have.contains(edge) {
+                    if let Err(e) = self.bd.dep_remove(&from, &to).await {
+                        warn!("{shown}: could not remove: {e:#}");
+                        continue;
+                    }
+                    info!("{shown}: removed");
+                }
+                next.remove(edge);
+            }
+        }
+        if next == recorded {
+            return Ok(false);
+        }
+        self.state_set("relations", &serde_json::to_string(&next)?)
+            .await?;
+        Ok(true)
+    }
+
+    async fn github_relations(&self, scope: Option<&BTreeSet<u64>>) -> Result<GithubLinks> {
         let (owner, name) = self
             .repo()
             .split_once('/')
             .context("repository must be owner/name")?;
-        let nodes = self
-            .gh
-            .graphql_nodes(
-                RELATIONS_QUERY,
-                json!({"owner": owner, "repo": name}),
-                &["repository", "issues"],
-            )
-            .await?;
+        let variables = json!({"owner": owner, "repo": name});
+        let nodes = match scope {
+            None => {
+                self.gh
+                    .graphql_nodes(&relations_query(), variables, &["repository", "issues"])
+                    .await?
+            }
+            Some(scope) => {
+                let numbers: Vec<u64> = scope.iter().copied().collect();
+                let mut nodes = Vec::new();
+                for chunk in numbers.chunks(SCOPED_CHUNK) {
+                    let data = self
+                        .gh
+                        .graphql(&scoped_query(chunk), variables.clone())
+                        .await?;
+                    nodes.extend(
+                        chunk
+                            .iter()
+                            .map(|n| data["repository"][format!("i{n}")].clone())
+                            .filter(|node| !node.is_null()),
+                    );
+                }
+                nodes
+            }
+        };
         let own = |r: &Value| {
             r["repository"]["nameWithOwner"]
                 .as_str()
@@ -858,13 +1105,31 @@ impl Sync<'_> {
         })
     }
 
+    fn scope(&self) -> Option<BTreeSet<u64>> {
+        match &self.mode {
+            Mode::Issues(numbers) => Some(numbers.iter().copied().collect()),
+            _ => None,
+        }
+    }
+
+    async fn recorded_relations(&self) -> Result<BTreeSet<String>> {
+        match self.state_get("relations").await? {
+            Some(text) => serde_json::from_str(&text).context("parsing the recorded relations"),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
     async fn sync_relations(&self) -> Result<bool> {
+        let scope = self.scope();
+        if scope.as_ref().is_some_and(BTreeSet::is_empty) {
+            return Ok(false);
+        }
         let GithubLinks {
             relations: remote,
             mentions,
             pulls,
             duplicates,
-        } = match self.github_relations().await {
+        } = match self.github_relations(scope.as_ref()).await {
             Ok(found) => found,
             Err(e) => {
                 warn!("could not read relations from GitHub; skipping them: {e:#}");
@@ -873,32 +1138,28 @@ impl Sync<'_> {
         };
         let beads = self.bd.export().await?;
         let linked = linked(&beads, self.repo());
-        let number_of: BTreeMap<&str, u64> =
-            linked.iter().map(|(n, id)| (id.as_str(), *n)).collect();
-        let have: BTreeSet<String> = beads
-            .iter()
-            .flat_map(Bead::relations)
-            .filter_map(|d| {
-                Some(format!(
-                    "{} {} {}",
-                    number_of.get(d.issue_id.as_str())?,
-                    d.kind,
-                    number_of.get(d.depends_on_id.as_str())?
-                ))
+        let in_scope = |edge: &&String| {
+            scope.as_ref().is_none_or(|scope| {
+                let [from, _] = edge_numbers(edge);
+                scope.contains(&from)
             })
-            .collect();
-        let base: BTreeSet<String> = match self.state_get("relations").await? {
-            Some(text) => serde_json::from_str(&text).context("parsing the recorded relations")?,
-            None => BTreeSet::new(),
         };
+        let have: BTreeSet<String> = relation_edges(&beads, &linked)
+            .iter()
+            .filter(in_scope)
+            .cloned()
+            .collect();
+        let recorded = self.recorded_relations().await?;
+        let base: BTreeSet<String> = recorded.iter().filter(in_scope).cloned().collect();
         let plan = plan_relations(&remote, &base, &have, &linked);
 
-        let ids = |edge: &str| -> (String, String, String) {
-            let parts: Vec<&str> = edge.split(' ').collect();
-            let id = |n: &str| linked[&n.parse::<u64>().unwrap()].clone();
-            (id(parts[0]), parts[1].to_string(), id(parts[2]))
-        };
-        let mut next_base = plan.base.clone();
+        let ids = |edge: &str| edge_beads(edge, &linked).expect("planned edges are linked");
+        let mut next_base: BTreeSet<String> = recorded
+            .iter()
+            .filter(|edge| !in_scope(edge))
+            .chain(&plan.base)
+            .cloned()
+            .collect();
         for edge in &plan.add {
             let (from, kind, to) = ids(edge);
             let shown = edge_for_log(edge);
@@ -918,14 +1179,15 @@ impl Sync<'_> {
             }
         }
         let mut changed = false;
-        if next_base != base {
+        if next_base != recorded {
             self.state_set("relations", &serde_json::to_string(&next_base)?)
                 .await?;
             changed = true;
         }
+        let scoped = scope.is_some();
         let duplicated = self.import_duplicates(&linked, &duplicates).await?;
-        let mentioned = self.import_mentions(&linked, &mentions).await?;
-        let pulled = self.import_pulls(&linked, &pulls).await?;
+        let mentioned = self.import_mentions(&linked, &mentions, scoped).await?;
+        let pulled = self.import_pulls(&linked, &pulls, scoped).await?;
         Ok(changed || duplicated || mentioned || pulled)
     }
 
@@ -964,6 +1226,7 @@ impl Sync<'_> {
         &self,
         linked: &BTreeMap<u64, String>,
         pulls: &BTreeMap<String, (u64, String)>,
+        scoped: bool,
     ) -> Result<bool> {
         let seen: BTreeSet<String> = match self.state_get("pulls").await? {
             Some(text) => serde_json::from_str(&text).context("parsing the recorded pulls")?,
@@ -974,7 +1237,11 @@ impl Sync<'_> {
             .filter(|(_, (n, _))| linked.contains_key(n))
             .map(|(url, _)| url.clone())
             .collect();
-        let mut recorded = next.clone();
+        let mut recorded = if scoped {
+            seen.union(&next).cloned().collect()
+        } else {
+            next.clone()
+        };
         let beads = self.bd.export().await?;
         for url in next.difference(&seen) {
             let (n, author) = &pulls[url];
@@ -1020,6 +1287,7 @@ impl Sync<'_> {
         &self,
         linked: &BTreeMap<u64, String>,
         mentions: &BTreeSet<String>,
+        scoped: bool,
     ) -> Result<bool> {
         let beads = self.bd.export().await?;
         let imported: BTreeSet<String> = match self.state_get("mentions").await? {
@@ -1051,7 +1319,11 @@ impl Sync<'_> {
             .filter(|e| both_linked(e))
             .cloned()
             .collect();
-        let mut recorded = next.clone();
+        let mut recorded = if scoped {
+            imported.union(&next).cloned().collect()
+        } else {
+            next.clone()
+        };
         for edge in next.difference(&imported).filter(|e| !have.contains(*e)) {
             let parts: Vec<&str> = edge.split(' ').collect();
             let id = |n: &str| linked[&n.parse::<u64>().unwrap()].clone();
@@ -1227,21 +1499,51 @@ impl Sync<'_> {
                 }
             }
         }
-        let pulled = self.pull_issues(since.as_deref()).await?;
+        let mut changes = Vec::new();
+        if let Mode::Events {
+            issues,
+            changes: queued,
+        } = self.mode.clone()
+        {
+            let linked = linked(&self.bd.export().await?, self.repo());
+            let mut numbers: BTreeSet<u64> = issues.into_iter().collect();
+            numbers.extend(
+                queued
+                    .iter()
+                    .flat_map(Change::issues)
+                    .filter(|n| !linked.contains_key(n)),
+            );
+            self.mode = Mode::Issues(numbers.into_iter().collect());
+            changes = queued;
+        }
+        let skip: BTreeSet<u64> = self.scope().unwrap_or_default();
+        let idle = matches!(&self.mode, Mode::Issues(numbers) if numbers.is_empty());
+        let mut comments_changed = false;
+        let mut relations_changed = false;
+        let mut pulled = None;
+        if !idle {
+            pulled = Some(self.pull_issues(since.as_deref()).await?);
+        }
         if let Err(e) = self.shorten_imports().await {
             warn!("could not shorten imported bead ids: {e:#}");
         }
-        let (comments_changed, from_comment) = self
-            .import_comments(&pulled.commented, &pulled.closing)
-            .await?;
-        self.import_close_reasons(&pulled.closed, &from_comment)
-            .await?;
-        let relations_changed = self.sync_relations().await?;
+        if let Some(pulled) = pulled {
+            let (changed, from_comment) = self
+                .import_comments(&pulled.commented, &pulled.closing)
+                .await?;
+            comments_changed = changed;
+            self.import_close_reasons(&pulled.closed, &from_comment)
+                .await?;
+            relations_changed = self.sync_relations().await?;
+        }
+        let applied = self.apply_changes(&changes, &skip).await?;
         if let Err(e) = self.nest_fresh().await {
             warn!("could not nest new beads under their parents: {e:#}");
         }
-        let changed =
-            relations_changed || comments_changed || self.bd.export_raw().await? != before;
+        let changed = relations_changed
+            || comments_changed
+            || applied
+            || self.bd.export_raw().await? != before;
         if changed && !matches!(self.mode, Mode::Issues(_)) {
             self.state_set("since", &self.next_since).await?;
         }
