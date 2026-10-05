@@ -17,8 +17,8 @@ use crate::{
     github::{DEFAULT_API_URL, GitHub, Response},
     ids,
     sync::{
-        COMMENT_MARKER, PRIORITIES, TEXT_LIMIT, TextAction, TextField, TextState, is_sync_note,
-        normalize, reconcile_text, rejoin_parts, split_text, state_reason_for,
+        COMMENT_MARKER, TEXT_LIMIT, TextAction, TextField, TextState, has_priority_label,
+        is_sync_note, normalize, reconcile_text, rejoin_parts, split_text, state_reason_for,
     },
 };
 
@@ -125,10 +125,6 @@ fn matches_issue(bead: &Bead, issue: &Value) -> bool {
         .flatten()
         .filter_map(|l| l["name"].as_str())
         .collect();
-    let priority = bead
-        .priority
-        .as_u64()
-        .and_then(|p| PRIORITIES.get(p as usize));
     text(&bead.title) == text(&issue["title"])
         && normalize(bead.description.as_deref().unwrap_or_default()) == text(&issue["body"])
         && bead.is_closed() == (issue["state"] == "closed")
@@ -137,7 +133,10 @@ fn matches_issue(bead: &Bead, issue: &Value) -> bool {
             .issue_type
             .as_str()
             .is_some_and(|t| labels.contains(&format!("type::{t}").as_str()))
-        && priority.is_some_and(|p| labels.contains(&format!("priority::{p}").as_str()))
+        && bead
+            .priority
+            .as_u64()
+            .is_some_and(|p| has_priority_label(p as usize, &labels))
 }
 
 pub(crate) fn ignored(path: &Path) -> bool {

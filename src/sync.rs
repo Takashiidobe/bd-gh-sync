@@ -68,13 +68,28 @@ const TYPES: &[&str] = &[
     "story",
     "milestone",
 ];
-pub const PRIORITIES: &[&str] = &["critical", "high", "medium", "low", "backlog"];
+const PRIORITIES: &[&str] = &["critical", "high", "medium", "low", "backlog"];
+const PRIORITY_LABELS: &[&str] = &["critical", "high", "medium", "low", "backlog", "none"];
+
+pub fn priority_rank(name: &str) -> Option<usize> {
+    PRIORITIES
+        .iter()
+        .position(|p| *p == name)
+        .or_else(|| (name == "none").then_some(PRIORITIES.len() - 1))
+}
+
+pub fn has_priority_label(rank: usize, labels: &[&str]) -> bool {
+    labels
+        .iter()
+        .filter_map(|l| l.strip_prefix("priority::"))
+        .any(|name| priority_rank(name) == Some(rank))
+}
 const IN_PROGRESS_LABEL: &str = "status::in_progress";
 
 pub fn known_label(label: &str) -> bool {
     match label.split_once("::") {
         Some(("type", value)) => TYPES.contains(&value),
-        Some(("priority", value)) => PRIORITIES.contains(&value),
+        Some(("priority", value)) => PRIORITY_LABELS.contains(&value),
         Some(("status", _)) => label == IN_PROGRESS_LABEL,
         _ => false,
     }
@@ -139,8 +154,7 @@ pub fn plan_fields(bead: &Bead, change: &FieldChange) -> FieldPlan {
                 }
             }
             Some(("priority", _)) => {
-                if let Some(rank) = only("priority::", PRIORITIES)
-                    .and_then(|name| PRIORITIES.iter().position(|p| *p == name))
+                if let Some(rank) = only("priority::", PRIORITY_LABELS).and_then(priority_rank)
                     && bead.priority.as_u64() != Some(rank as u64)
                 {
                     set("-p", &rank.to_string());
@@ -980,11 +994,9 @@ impl Sync<'_> {
             {
                 report(*n, id, format!("type label type::{kind} missing"));
             }
-            if let Some(name) = bead
-                .priority
-                .as_u64()
-                .and_then(|p| PRIORITIES.get(p as usize))
-                && !labels.contains(&format!("priority::{name}").as_str())
+            if let Some(rank) = bead.priority.as_u64().map(|p| p as usize)
+                && let Some(name) = PRIORITIES.get(rank)
+                && !has_priority_label(rank, &labels)
             {
                 report(*n, id, format!("priority label priority::{name} missing"));
             }
@@ -1555,8 +1567,8 @@ impl Sync<'_> {
                 .filter_map(|l| l.strip_prefix(prefix))
                 .find(|v| values.contains(v))
         };
-        let priority = only("priority::", PRIORITIES)
-            .and_then(|name| PRIORITIES.iter().position(|p| *p == name))
+        let priority = only("priority::", PRIORITY_LABELS)
+            .and_then(priority_rank)
             .unwrap_or(2);
         let mut fields = vec![
             "-t".to_string(),
