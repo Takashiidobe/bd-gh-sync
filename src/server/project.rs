@@ -126,12 +126,36 @@ impl Project {
             .map(drop)
     }
 
+    fn head_file(&self) -> PathBuf {
+        self.dir.join(".git/bd-gh-sync/dolt-head")
+    }
+
+    pub fn processed_head(&self) -> Option<String> {
+        let head = std::fs::read_to_string(self.head_file()).ok()?;
+        Some(head.trim().to_string()).filter(|h| !h.is_empty())
+    }
+
+    pub async fn remote_head(&self, config: &Config, secrets: &Secrets) -> Result<Option<String>> {
+        let wd = self.workdir(&self.dir, config, secrets);
+        let out = wd
+            .run("git", &["ls-remote", "origin", "refs/dolt/data"])
+            .await?;
+        Ok(out.split_whitespace().next().map(str::to_string))
+    }
+
     pub async fn push(&self, config: &Config, secrets: &Secrets) -> Result<()> {
         let span = info_span!("push", project = %self.repo);
         async {
+            let head = self.remote_head(config, secrets).await?;
             let wd = self.workdir(&self.dir, config, secrets);
             Bd::new(&wd).dolt_pull().await?;
-            watch::push_beads(wd, GitHub::new(&config.api_url, &secrets.token)).await
+            watch::push_beads(wd, GitHub::new(&config.api_url, &secrets.token)).await?;
+            if let Some(head) = head {
+                let file = self.head_file();
+                std::fs::create_dir_all(file.parent().expect("head file has a parent"))?;
+                std::fs::write(file, head)?;
+            }
+            Ok(())
         }
         .instrument(span)
         .await

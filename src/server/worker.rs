@@ -29,6 +29,7 @@ pub enum Job {
     Changes(Vec<Change>),
     Pulls(BTreeSet<u64>),
     SinceLast,
+    Push,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -37,6 +38,7 @@ pub struct Batch {
     changes: Vec<Change>,
     pulls: BTreeSet<u64>,
     since_last: bool,
+    push: bool,
 }
 
 impl Batch {
@@ -46,6 +48,7 @@ impl Batch {
             Job::Changes(changes) => self.changes.extend(changes),
             Job::Pulls(pulls) => self.pulls.extend(pulls),
             Job::SinceLast => self.since_last = true,
+            Job::Push => self.push = true,
         }
     }
 
@@ -54,6 +57,7 @@ impl Batch {
             && self.changes.is_empty()
             && self.pulls.is_empty()
             && !self.since_last
+            && !self.push
     }
 
     pub fn mode(&self) -> Mode {
@@ -256,6 +260,16 @@ async fn run(
 ) {
     let config = &ctx.config;
     while let Some(mut batch) = next_batch(&mut rx, config.debounce(), config.max_wait()).await {
+        if std::mem::take(&mut batch.push)
+            && let Err(e) = project.push(config, &ctx.secrets).await
+        {
+            error!(project = %project.repo, "push failed: {e:#}; retrying in {}s", RETRY_AFTER.as_secs());
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(RETRY_AFTER).await;
+                let _ = tx.send(Job::Push);
+            });
+        }
         if !batch.pulls.is_empty() {
             let gh = GitHub::new(&config.api_url, &ctx.secrets.token);
             match closing_issues(&gh, &project.repo, &batch.pulls).await {

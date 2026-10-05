@@ -24,6 +24,8 @@ pub struct Config {
     pub max_wait_ms: u64,
     #[serde(default = "default_reconcile_minutes")]
     pub reconcile_minutes: u64,
+    #[serde(default = "default_dolt_poll_seconds")]
+    pub dolt_poll_seconds: u64,
     #[serde(default = "default_transport")]
     pub transport: Transport,
     #[serde(default = "default_git_base")]
@@ -62,6 +64,9 @@ fn default_max_wait_ms() -> u64 {
 fn default_reconcile_minutes() -> u64 {
     60
 }
+fn default_dolt_poll_seconds() -> u64 {
+    10
+}
 fn default_transport() -> Transport {
     Transport::Auto
 }
@@ -94,6 +99,10 @@ impl Config {
 
     pub fn reconcile_every(&self) -> Duration {
         Duration::from_secs(self.reconcile_minutes.max(1) * 60)
+    }
+
+    pub fn dolt_poll(&self) -> Option<Duration> {
+        (self.dolt_poll_seconds > 0).then(|| Duration::from_secs(self.dolt_poll_seconds))
     }
 
     pub fn webhook_url(&self) -> Result<String> {

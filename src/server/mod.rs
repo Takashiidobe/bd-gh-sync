@@ -103,8 +103,13 @@ pub async fn serve(config: Config) -> Result<()> {
         }
     });
 
+    if let Some(every) = workers.context().config.dolt_poll() {
+        tokio::spawn(poll_dolt_heads(workers.clone(), every));
+    }
+
     let app = Router::new()
         .route("/webhook", post(receive))
+        .route("/poke", post(poke))
         .route("/healthz", get(|| async { "ok" }))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(workers);
@@ -119,6 +124,79 @@ pub async fn serve(config: Config) -> Result<()> {
     .with_graceful_shutdown(shutdown())
     .await?;
     Ok(())
+}
+
+async fn poll_dolt_heads(workers: Arc<Workers>, every: std::time::Duration) {
+    let ctx = workers.context();
+    let mut seen: std::collections::HashMap<String, Option<String>> = Default::default();
+    let mut tick = tokio::time::interval(every);
+    loop {
+        tick.tick().await;
+        let projects = match Project::discover(&ctx.config.data_dir) {
+            Ok(projects) => projects,
+            Err(e) => {
+                warn!("listing projects: {e:#}");
+                continue;
+            }
+        };
+        for project in projects {
+            let head = match project.remote_head(&ctx.config, &ctx.secrets).await {
+                Ok(Some(head)) => head,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(project = %project.repo, "reading refs/dolt/data: {e:#}");
+                    continue;
+                }
+            };
+            let last = seen
+                .entry(project.repo.clone())
+                .or_insert_with(|| project.processed_head());
+            if last.as_deref() != Some(head.as_str()) {
+                info!(project = %project.repo, "refs/dolt/data moved to {head}");
+                *last = Some(head);
+                workers.submit(&project, Job::Push);
+            }
+        }
+    }
+}
+
+async fn poke(
+    State(workers): State<Arc<Workers>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, String) {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let source = header("x-forwarded-for")
+        .and_then(|list| list.split(',').next())
+        .map_or_else(|| peer.ip().to_string(), |ip| ip.trim().to_string());
+    if workers.blocked(&source) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many failures".into());
+    }
+    let repo = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["repo"].as_str().map(str::to_string));
+    let context = workers.context();
+    let Some(repo) = repo else {
+        workers.bad_signature(&source);
+        return (StatusCode::BAD_REQUEST, "expected {\"repo\": \"owner/name\"}".into());
+    };
+    let secret = config::repo_secret(&context.config.data_dir, &repo)
+        .unwrap_or_else(|| context.secrets.webhook_secret.clone());
+    if !webhook::verify(secret.as_bytes(), &body, header("x-hub-signature-256")) {
+        workers.bad_signature(&source);
+        warn!("rejected a poke from {source} with a bad signature");
+        return (StatusCode::UNAUTHORIZED, "bad signature".into());
+    }
+    match Project::find(&context.config.data_dir, &repo) {
+        Ok(Some(project)) => {
+            info!(project = %project.repo, "poked");
+            workers.submit(&project, Job::Push);
+            (StatusCode::ACCEPTED, "queued".into())
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, format!("{repo} is not a project here")),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
 }
 
 fn require_projects_token(config: &Config, secrets: &Secrets) -> Result<()> {
