@@ -43,6 +43,7 @@ pub enum Change {
     Relation {
         edge: String,
         added: bool,
+        at: String,
     },
     Field(FieldChange),
 }
@@ -174,7 +175,41 @@ pub fn plan_fields(bead: &Bead, change: &FieldChange) -> FieldPlan {
     plan
 }
 
+const TOMBSTONE: &str = "~";
+const APPLIED_KEY: &str = "applied";
+
+type Marks = BTreeMap<String, String>;
+
 impl Change {
+    fn mark(&self) -> Option<(String, String)> {
+        let (key, at) = match self {
+            Change::Comment {
+                issue,
+                action,
+                comment,
+            } => {
+                let at = match action {
+                    CommentAction::Deleted => TOMBSTONE,
+                    _ => comment["updated_at"].as_str()?,
+                };
+                (format!("{issue}/{}", comment["id"].as_u64()?), at)
+            }
+            Change::Field(change) => (
+                change.issue["number"].as_u64()?.to_string(),
+                change.issue["updated_at"].as_str()?,
+            ),
+            Change::Relation { edge, at, .. } => (format!("e:{edge}"), at.as_str()),
+        };
+        (!at.is_empty()).then(|| (key, at.to_string()))
+    }
+
+    fn is_stale(&self, marks: &Marks) -> bool {
+        let Some((key, at)) = self.mark() else {
+            return false;
+        };
+        at != TOMBSTONE && marks.get(&key).is_some_and(|applied| at < *applied)
+    }
+
     fn issues(&self) -> Vec<u64> {
         match self {
             Change::Comment { issue, .. } => vec![*issue],
@@ -246,6 +281,7 @@ pub async fn run(wd: &Workdir, gh: &GitHub, opts: &Options) -> Result<()> {
             .dir
             .join(opts.jsonl.parent().unwrap_or(Path::new("")))
             .join("github-sync.json"),
+        marks: Default::default(),
     };
     let started = Instant::now();
     let result = match transport {
@@ -310,6 +346,7 @@ struct Sync<'a> {
     mode: Mode,
     next_since: String,
     state_file: PathBuf,
+    marks: std::sync::Mutex<Marks>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -320,6 +357,7 @@ pub struct IssueInfo {
     pub comments: u64,
     pub state_reason: Option<String>,
     pub closing: Option<Closing>,
+    pub updated_at: Option<String>,
 }
 
 impl IssueInfo {
@@ -339,6 +377,7 @@ impl IssueInfo {
             is_pr: !issue["pull_request"].is_null(),
             bd_created: has("type::") && has("priority::"),
             comments: issue["comments"].as_u64().unwrap_or(0),
+            updated_at: issue["updated_at"].as_str().map(str::to_string),
             state_reason: (issue["state"] == "closed").then(|| {
                 issue["state_reason"]
                     .as_str()
@@ -660,6 +699,51 @@ impl Sync<'_> {
         }
     }
 
+    fn mark(&self, key: String, at: String) {
+        let mut marks = self.marks.lock().unwrap();
+        match marks.get(&key) {
+            Some(known) if *known >= at => {}
+            _ => {
+                marks.insert(key, at);
+            }
+        }
+    }
+
+    async fn applied_marks(&self) -> Result<Marks> {
+        match self.state_get(APPLIED_KEY).await? {
+            Some(text) => serde_json::from_str(&text).context("parsing the applied timestamps"),
+            None => Ok(Marks::new()),
+        }
+    }
+
+    async fn flush_marks(&self, linked: &BTreeMap<u64, String>) -> Result<()> {
+        let pending = std::mem::take(&mut *self.marks.lock().unwrap());
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let before = self.applied_marks().await?;
+        let mut all = before.clone();
+        for (key, at) in pending {
+            match all.get(&key) {
+                Some(known) if *known >= at => {}
+                _ => {
+                    all.insert(key, at);
+                }
+            }
+        }
+        all.retain(|key, _| {
+            let key = key.strip_prefix("e:").unwrap_or(key);
+            key.split(['/', ' '])
+                .filter_map(|part| part.parse::<u64>().ok())
+                .any(|n| linked.contains_key(&n))
+        });
+        if all != before {
+            self.state_set(APPLIED_KEY, &serde_json::to_string(&all)?)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn describe_issues(
         &self,
         since: Option<&str>,
@@ -800,6 +884,9 @@ impl Sync<'_> {
                 continue;
             }
             to_pull.push(issue.number);
+            if let Some(at) = issue.updated_at {
+                self.mark(issue.number.to_string(), at);
+            }
             if let Some(reason) = issue.state_reason {
                 closed.insert(issue.number, reason);
             }
@@ -920,6 +1007,15 @@ impl Sync<'_> {
                 .collect();
             let previous = before.get(n).cloned().unwrap_or_default();
             let mut plan = plan_comments(&github, &have, &previous);
+            for comment in &github {
+                if let (Some(cid), Some(at)) = (comment["id"].as_u64(), comment["updated_at"].as_str())
+                {
+                    self.mark(format!("{n}/{cid}"), at.to_string());
+                }
+            }
+            for (cid, _) in &plan.deleted {
+                self.mark(format!("{n}/{cid}"), TOMBSTONE.to_string());
+            }
             let mut tracked = plan.tracked.clone();
             let revert = |cid: u64, tracked: &mut Tracked| match previous.get(&cid) {
                 Some(entry) => tracked.insert(cid, entry.clone()),
@@ -1173,7 +1269,7 @@ impl Sync<'_> {
         let queued: Vec<(&str, bool)> = changes
             .iter()
             .filter_map(|change| match change {
-                Change::Relation { edge, added } if !skip.contains(&edge_numbers(edge)[0]) => {
+                Change::Relation { edge, added, .. } if !skip.contains(&edge_numbers(edge)[0]) => {
                     Some((edge.as_str(), *added))
                 }
                 _ => None,
@@ -1717,15 +1813,25 @@ impl Sync<'_> {
         } = self.mode.clone()
         {
             let linked = linked(&self.bd.export().await?, self.repo());
+            let applied = self.applied_marks().await?;
+            let (stale, fresh): (Vec<Change>, Vec<Change>) =
+                queued.into_iter().partition(|c| c.is_stale(&applied));
+            if !stale.is_empty() {
+                info!(
+                    "{} stale event(s) arrived out of order; refreshing those issues from GitHub",
+                    stale.len()
+                );
+            }
             let mut numbers: BTreeSet<u64> = issues.into_iter().collect();
+            numbers.extend(stale.iter().flat_map(Change::issues));
             numbers.extend(
-                queued
+                fresh
                     .iter()
                     .flat_map(Change::issues)
                     .filter(|n| !linked.contains_key(n)),
             );
             self.mode = Mode::Issues(numbers.into_iter().collect());
-            changes = queued;
+            changes = fresh;
         }
         let skip: BTreeSet<u64> = self.scope().unwrap_or_default();
         let idle = matches!(&self.mode, Mode::Issues(numbers) if numbers.is_empty());
@@ -1757,6 +1863,18 @@ impl Sync<'_> {
         let applied = self.apply_changes(&changes, &skip).await?;
         if let Err(e) = self.nest_fresh().await {
             warn!("could not nest new beads under their parents: {e:#}");
+        }
+        let skipped = &skip;
+        for (key, at) in changes
+            .iter()
+            .filter(|c| !c.issues().iter().any(|n| skipped.contains(n)))
+            .filter_map(Change::mark)
+        {
+            self.mark(key, at);
+        }
+        let current = linked(&self.bd.export().await?, self.repo());
+        if let Err(e) = self.flush_marks(&current).await {
+            warn!("could not record the applied timestamps: {e:#}");
         }
         let changed = relations_changed
             || comments_changed

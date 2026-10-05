@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    io::Write,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -8,7 +10,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     time::{Instant, timeout_at},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     server::{
@@ -87,6 +89,26 @@ const REMEMBERED_DELIVERIES: usize = 4096;
 struct Deliveries {
     order: VecDeque<String>,
     ids: HashSet<String>,
+    written: usize,
+}
+
+impl Deliveries {
+    fn insert(&mut self, id: &str) -> bool {
+        if !self.ids.insert(id.to_string()) {
+            return false;
+        }
+        self.order.push_back(id.to_string());
+        if self.order.len() > REMEMBERED_DELIVERIES
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.ids.remove(&oldest);
+        }
+        true
+    }
+}
+
+fn deliveries_path(ctx: &Context) -> PathBuf {
+    ctx.config.data_dir.join(".deliveries")
 }
 
 pub struct Workers {
@@ -97,10 +119,16 @@ pub struct Workers {
 
 impl Workers {
     pub fn new(ctx: Arc<Context>) -> Self {
+        let mut deliveries = Deliveries::default();
+        let path = deliveries_path(&ctx);
+        for id in std::fs::read_to_string(&path).unwrap_or_default().lines() {
+            deliveries.insert(id);
+        }
+        deliveries.written = deliveries.order.len();
         Self {
             ctx,
             queues: Mutex::default(),
-            deliveries: Mutex::default(),
+            deliveries: Mutex::new(deliveries),
         }
     }
 
@@ -110,14 +138,24 @@ impl Workers {
 
     pub fn remember_delivery(&self, id: &str) {
         let mut deliveries = self.deliveries.lock().unwrap();
-        if !deliveries.ids.insert(id.to_string()) {
+        if !deliveries.insert(id) {
             return;
         }
-        deliveries.order.push_back(id.to_string());
-        if deliveries.order.len() > REMEMBERED_DELIVERIES
-            && let Some(oldest) = deliveries.order.pop_front()
-        {
-            deliveries.ids.remove(&oldest);
+        let path = deliveries_path(&self.ctx);
+        let saved = if deliveries.written >= 2 * REMEMBERED_DELIVERIES {
+            let all: Vec<&str> = deliveries.order.iter().map(String::as_str).collect();
+            std::fs::write(&path, all.join("\n") + "\n").map(|()| all.len())
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| writeln!(f, "{id}"))
+                .map(|()| deliveries.written + 1)
+        };
+        match saved {
+            Ok(written) => deliveries.written = written,
+            Err(e) => warn!("could not record delivery {id} in {}: {e}", path.display()),
         }
     }
 

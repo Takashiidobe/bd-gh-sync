@@ -86,6 +86,11 @@ pub fn parse(event: &str, payload: &Value) -> Event {
     }
 }
 
+fn latest(a: &Value, b: &Value) -> String {
+    let at = |issue: &Value| issue["updated_at"].as_str().unwrap_or_default().to_string();
+    at(a).max(at(b))
+}
+
 fn change_of(
     event: &str,
     payload: &Value,
@@ -144,6 +149,7 @@ fn change_of(
             Some(Change::Relation {
                 edge: format!("{sub} parent-child {parent}"),
                 added: added?,
+                at: latest(&payload["parent_issue"], &payload["sub_issue"]),
             })
         }
         "issue_dependencies" => {
@@ -152,6 +158,7 @@ fn change_of(
             Some(Change::Relation {
                 edge: format!("{blocked} blocks {blocking}"),
                 added: added?,
+                at: latest(&payload["blocked_issue"], &payload["blocking_issue"]),
             })
         }
         _ => None,
